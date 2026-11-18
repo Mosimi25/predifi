@@ -4,6 +4,12 @@ The backend reads Soroban contract state through `PREDIFI_STELLAR_RPC_URL` and
 records those calls under `query_type` values containing `contract`. The
 contract itself is authoritative ([ADR 0001](../adr/0001-contract-state-authoritative.md)).
 
+For the schema and contract change workflow (including how contract interface
+changes are proposed, reviewed, and rolled out) and for release sign-off
+requirements, see the maintainer handbook:
+[`docs/maintainer-handbook.md`](../maintainer-handbook.md). Any contract
+interface change must follow that workflow before it reaches production.
+
 ---
 
 ## ContractInteractionFailures
@@ -39,6 +45,9 @@ before and after.
 3. **Contract interface change:** roll back the backend to the last release
    compatible with the deployed contract. Do **not** call admin or upgrade
    functions on the contract as a mitigation without maintainer approval.
+   Follow the schema and contract change workflow in the
+   [maintainer handbook](../maintainer-handbook.md) for the forward fix, and
+   obtain release sign-off as described there before shipping it.
 
 **Verification:** Contract error rate is 0 for 10 minutes and
 `GET /api/v1/pools/<id>` for a recently active pool matches the chain.

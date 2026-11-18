@@ -194,6 +194,10 @@ console.log('Transaction hash:', result.hash);
 - Understand [Oracle Resolution](./oracles.md)
 - Check [Troubleshooting](./troubleshooting.md) for common issues
 
+## Contributor vs. Maintainer Responsibilities
+
+This quickstart covers the **contributor** path: building a client, placing predictions, and opening pull requests. If you are taking on **maintainer** duties — code ownership, schema and contract change approvals, incident response, or release sign-off — read the [Maintainer Handbook](./maintainer-handbook.md) before merging or releasing anything.
+
 :::tip
 **Need Help?** Join our [Telegram community](https://t.me/predifi_onchain_build/1) for support and updates.
 :::

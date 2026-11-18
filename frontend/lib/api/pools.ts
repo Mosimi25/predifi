@@ -26,7 +26,17 @@ export function wsBaseUrl(): string {
   return `ws://${http}`;
 }
 
-/** A single prediction-market pool. */
+/**
+ * A single prediction-market pool.
+ *
+ * Field ownership (see `docs/data-ownership.md`):
+ * - `total_stake` — authoritative on-chain (pool contract); the indexer mirrors
+ *   it and the API serves the mirrored value. Freshness: eventual (indexer lag).
+ * - `state` / `result` / `end_time` — lifecycle fields owned by the chain; the
+ *   API is a read-through mirror and must never invent transitions.
+ * - `odds` (see {@link PoolDetail}) — derived by the backend from on-chain
+ *   stakes; treat as a price snapshot, not a source of truth.
+ */
 export interface Pool {
   pool_id: number;
   name: string;
@@ -47,7 +57,13 @@ export interface Pool {
   description?: string;
 }
 
-/** Per-outcome stake and implied odds from `GET /api/v1/pools/:id`. */
+/**
+ * Per-outcome stake and implied odds from `GET /api/v1/pools/:id`.
+ *
+ * `stake` is the chain-authoritative per-outcome balance mirrored by the
+ * indexer; `odds` is a backend-derived price. When the two disagree with the
+ * chain, the chain wins and the UI must show the on-chain stake.
+ */
 export interface OutcomeOdds {
   outcome: number;
   stake: number;
@@ -297,6 +313,10 @@ export async function fetchPoolDetail(url: string, timeout?: number): Promise<Po
       ? Math.floor(new Date(rawEnd).getTime() / 1000)
       : Number(rawEnd ?? 0);
 
+  // Fallback contract: a missing `odds` array means "no price data yet" and is
+  // surfaced as an empty list rather than `undefined`, so consumers never have
+  // to branch on presence. Balances (`total_stake`, per-outcome `stake`) are
+  // never defaulted — a missing balance is a contract violation, not zero.
   return {
     ...pool,
     end_time: endTime,
@@ -312,7 +332,13 @@ export async function fetchPoolById(id: string | number, timeout?: number): Prom
   return fetchPoolDetail(poolDetailUrl(id), timeout);
 }
 
-/** Live event pushed over `/api/v1/ws`. */
+/**
+ * Live event pushed over `/api/v1/ws`.
+ *
+ * Live events are a *hint*, not a source of truth: they may arrive out of
+ * order or be dropped. Consumers must reconcile against the next API/chain
+ * read (see `docs/data-ownership.md` → "Conflict behavior").
+ */
 export interface PoolLiveEvent {
   type: string;
   pool_id: number;

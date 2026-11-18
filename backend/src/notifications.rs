@@ -13,6 +13,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
 /// How far ahead of `end_time` a pool counts as "ending soon".
@@ -25,6 +26,341 @@ const NEW_POOL_LOOKBACK: &str = "1 day";
 const MAX_DELIVERY_ATTEMPTS: i32 = 5;
 /// How long a claimed outbox row is leased before another worker may reclaim it.
 const CLAIM_LEASE_SECONDS: i64 = 60;
+
+// ── Provider credential rotation (#355) ─────────────────────────────────────
+
+/// A provider credential identified by an opaque key id.
+///
+/// The key id is what appears in audit records; the secret itself is never
+/// logged. A credential can be `Active` (usable for delivery), `Revoked`
+/// (must never deliver again), or `Retired` (kept only for the tail of a
+/// dual-key transition window).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCredential {
+    pub key_id: String,
+    pub secret: String,
+    pub state: CredentialState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialState {
+    Active,
+    Revoked,
+    Retired,
+}
+
+impl CredentialState {
+    fn as_str(self) -> &'static str {
+        match self {
+            CredentialState::Active => "active",
+            CredentialState::Revoked => "revoked",
+            CredentialState::Retired => "retired",
+        }
+    }
+}
+
+/// Whether the provider accepts two credentials at once during a rotation.
+///
+/// Dual-key transition is only permitted where provider semantics allow it;
+/// providers that do not support overlapping keys must use a hard cutover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DualKeySupport {
+    Supported,
+    Unsupported,
+}
+
+/// The set of credentials currently configured for the notification provider.
+///
+/// Delivery always uses the `Active` credential. During a dual-key transition
+/// the previous credential is retained as `Retired` so in-flight deliveries
+/// signed with it can still be verified, but it is never used to sign new
+/// deliveries. A `Revoked` credential is rejected outright.
+#[derive(Debug, Clone)]
+pub struct CredentialSet {
+    pub active: ProviderCredential,
+    pub previous: Option<ProviderCredential>,
+    pub dual_key: DualKeySupport,
+}
+
+impl CredentialSet {
+    /// Build a credential set with a single active credential.
+    pub fn single(active: ProviderCredential) -> Self {
+        Self {
+            active,
+            previous: None,
+            dual_key: DualKeySupport::Unsupported,
+        }
+    }
+
+    /// Return the credential used to sign a new delivery, or an error if the
+    /// active credential has been revoked.
+    pub fn signing_credential(&self) -> Result<&ProviderCredential, RotationError> {
+        match self.active.state {
+            CredentialState::Active => Ok(&self.active),
+            CredentialState::Revoked => Err(RotationError::RevokedCredential {
+                key_id: self.active.key_id.clone(),
+            }),
+            CredentialState::Retired => Err(RotationError::NoActiveCredential),
+        }
+    }
+
+    /// Verify that a credential presented by the provider is still acceptable.
+    /// Revoked credentials are always rejected, even during a transition.
+    pub fn accepts(&self, key_id: &str) -> bool {
+        if self.active.key_id == key_id && self.active.state == CredentialState::Active {
+            return true;
+        }
+        match &self.previous {
+            Some(prev) => {
+                prev.key_id == key_id
+                    && self.dual_key == DualKeySupport::Supported
+                    && prev.state == CredentialState::Retired
+            }
+            None => false,
+        }
+    }
+}
+
+/// Errors raised while rotating or using provider credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RotationError {
+    /// The credential in use has been revoked and cannot deliver.
+    RevokedCredential { key_id: String },
+    /// No usable active credential is configured.
+    NoActiveCredential,
+    /// A dual-key transition was requested but the provider does not allow it.
+    DualKeyUnsupported,
+    /// The replacement credential is identical to the one being replaced.
+    SameCredential,
+}
+
+impl std::fmt::Display for RotationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RotationError::RevokedCredential { key_id } => {
+                write!(f, "provider credential {key_id} has been revoked")
+            }
+            RotationError::NoActiveCredential => write!(f, "no active provider credential"),
+            RotationError::DualKeyUnsupported => {
+                write!(f, "provider does not support dual-key transition")
+            }
+            RotationError::SameCredential => {
+                write!(f, "replacement credential matches the current credential")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RotationError {}
+
+/// Outcome of a rotation attempt, recorded in the audit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationOutcome {
+    /// New credential installed; old credential revoked immediately.
+    Completed,
+    /// New credential installed; old credential retained for a transition window.
+    DualKeyTransition,
+    /// Rotation was rejected; the old credential remains in place.
+    Rejected,
+}
+
+impl RotationOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            RotationOutcome::Completed => "completed",
+            RotationOutcome::DualKeyTransition => "dual_key_transition",
+            RotationOutcome::Rejected => "rejected",
+        }
+    }
+}
+
+/// An audit record for a credential rotation event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationAudit {
+    pub old_key_id: String,
+    pub new_key_id: String,
+    pub actor: String,
+    pub rotated_at: DateTime<Utc>,
+    pub outcome: RotationOutcome,
+    pub detail: Option<String>,
+}
+
+/// Sink for rotation audit records. Implementations persist to durable storage;
+/// the in-memory variant is used by tests and as a fallback.
+pub trait RotationAuditSink: Send + Sync {
+    fn record(&self, audit: &RotationAudit);
+}
+
+/// In-memory audit sink, useful for tests and single-process fallbacks.
+#[derive(Debug, Default)]
+pub struct InMemoryRotationAudit {
+    entries: std::sync::Mutex<Vec<RotationAudit>>,
+}
+
+impl InMemoryRotationAudit {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn entries(&self) -> Vec<RotationAudit> {
+        self.entries.lock().expect("audit lock poisoned").clone()
+    }
+}
+
+impl RotationAuditSink for InMemoryRotationAudit {
+    fn record(&self, audit: &RotationAudit) {
+        self.entries
+            .lock()
+            .expect("audit lock poisoned")
+            .push(audit.clone());
+    }
+}
+
+/// Persist a rotation audit record to the `credential_rotation_audit` table.
+pub async fn persist_rotation_audit(
+    pool: &PgPool,
+    audit: &RotationAudit,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO credential_rotation_audit
+            (old_key_id, new_key_id, actor, rotated_at, outcome, detail)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(&audit.old_key_id)
+    .bind(&audit.new_key_id)
+    .bind(&audit.actor)
+    .bind(audit.rotated_at)
+    .bind(audit.outcome.as_str())
+    .bind(&audit.detail)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Rotate the provider credential in `set` to `replacement`.
+///
+/// * When the provider supports dual-key transition, the old credential is
+///   retained as `Retired` for the transition window and the outcome is
+///   [`RotationOutcome::DualKeyTransition`].
+/// * Otherwise the old credential is revoked immediately and the outcome is
+///   [`RotationOutcome::Completed`].
+///
+/// The rotation event is always audited, including rejected attempts.
+pub fn rotate_credential(
+    set: &mut CredentialSet,
+    replacement: ProviderCredential,
+    actor: &str,
+    audit: &dyn RotationAuditSink,
+) -> Result<RotationOutcome, RotationError> {
+    let now = Utc::now();
+    let old_key_id = set.active.key_id.clone();
+    let new_key_id = replacement.key_id.clone();
+
+    let reject = |detail: &str| {
+        audit.record(&RotationAudit {
+            old_key_id: old_key_id.clone(),
+            new_key_id: new_key_id.clone(),
+            actor: actor.to_string(),
+            rotated_at: now,
+            outcome: RotationOutcome::Rejected,
+            detail: Some(detail.to_string()),
+        });
+    };
+
+    if old_key_id == new_key_id {
+        reject("replacement credential matches the current credential");
+        return Err(RotationError::SameCredential);
+    }
+
+    if replacement.state != CredentialState::Active {
+        reject("replacement credential is not active");
+        return Err(RotationError::NoActiveCredential);
+    }
+
+    let outcome = match set.dual_key {
+        DualKeySupport::Supported => {
+            let mut retired = set.active.clone();
+            retired.state = CredentialState::Retired;
+            set.previous = Some(retired);
+            RotationOutcome::DualKeyTransition
+        }
+        DualKeySupport::Unsupported => {
+            // Hard cutover: the old credential is revoked immediately so it can
+            // never deliver again.
+            set.previous = None;
+            RotationOutcome::Completed
+        }
+    };
+
+    set.active = replacement;
+
+    audit.record(&RotationAudit {
+        old_key_id,
+        new_key_id,
+        actor: actor.to_string(),
+        rotated_at: now,
+        outcome,
+        detail: None,
+    });
+
+    Ok(outcome)
+}
+
+/// A notification provider that can deliver a message using a credential.
+pub trait NotificationProvider: Send + Sync {
+    /// Deliver `message` to `recipient` using `credential`. Implementations
+    /// must reject revoked credentials.
+    fn deliver(
+        &self,
+        credential: &ProviderCredential,
+        recipient: &str,
+        message: &str,
+    ) -> Result<(), ProviderError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderError {
+    Revoked,
+    Unavailable,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderError::Revoked => write!(f, "provider rejected revoked credential"),
+            ProviderError::Unavailable => write!(f, "provider unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+/// Deliver a single message through `provider` using the active credential in
+/// `set`. Revoked credentials are rejected before the provider is called.
+pub fn deliver_with_credentials(
+    provider: &dyn NotificationProvider,
+    set: &CredentialSet,
+    recipient: &str,
+    message: &str,
+) -> Result<(), RotationError> {
+    let credential = set.signing_credential()?;
+    provider
+        .deliver(credential, recipient, message)
+        .map_err(|_| RotationError::RevokedCredential {
+            key_id: credential.key_id.clone(),
+        })
+}
+
+/// Shared handle to a credential set so the delivery worker can observe
+/// rotations without restarting.
+pub type SharedCredentials = Arc<std::sync::RwLock<CredentialSet>>;
+
+/// Wrap a credential set for concurrent use by the delivery worker.
+pub fn shared_credentials(set: CredentialSet) -> SharedCredentials {
+    Arc::new(std::sync::RwLock::new(set))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifType {
@@ -594,5 +930,128 @@ mod tests {
         assert_eq!(NotifType::PoolResolved.as_str(), "pool_resolved");
         assert_eq!(NotifType::ClaimExpiring.as_str(), "claim_expiring");
         assert_eq!(NotifType::NewPoolMatch.as_str(), "new_pool_match");
+    }
+
+    // ── Credential rotation tests (#355) ────────────────────────────────────
+
+    use std::sync::Mutex;
+
+    /// Mock provider that records deliveries and rejects revoked credentials.
+    #[derive(Default)]
+    struct MockProvider {
+        delivered: Mutex<Vec<(String, String)>>,
+    }
+
+    impl MockProvider {
+        fn delivered(&self) -> Vec<(String, String)> {
+            self.delivered.lock().unwrap().clone()
+        }
+    }
+
+    impl NotificationProvider for MockProvider {
+        fn deliver(
+            &self,
+            credential: &ProviderCredential,
+            recipient: &str,
+            message: &str,
+        ) -> Result<(), ProviderError> {
+            if credential.state != CredentialState::Active {
+                return Err(ProviderError::Revoked);
+            }
+            self.delivered
+                .lock()
+                .unwrap()
+                .push((recipient.to_string(), message.to_string()));
+            Ok(())
+        }
+    }
+
+    fn cred(key_id: &str, state: CredentialState) -> ProviderCredential {
+        ProviderCredential {
+            key_id: key_id.to_string(),
+            secret: format!("secret-{key_id}"),
+            state,
+        }
+    }
+
+    #[test]
+    fn revoked_credential_cannot_deliver() {
+        let provider = MockProvider::default();
+        let set = CredentialSet::single(cred("old-key", CredentialState::Revoked));
+
+        let result = deliver_with_credentials(&provider, &set, "0xabc", "hello");
+        assert!(matches!(
+            result,
+            Err(RotationError::RevokedCredential { .. })
+        ));
+        assert!(provider.delivered().is_empty());
+    }
+
+    #[test]
+    fn hard_cutover_revokes_old_credential_and_audits() {
+        let audit = InMemoryRotationAudit::new();
+        let mut set = CredentialSet::single(cred("old-key", CredentialState::Active));
+
+        let outcome =
+            rotate_credential(&mut set, cred("new-key", CredentialState::Active), "ops", &audit)
+                .expect("rotation succeeds");
+        assert_eq!(outcome, RotationOutcome::Completed);
+        assert_eq!(set.active.key_id, "new-key");
+        assert!(set.previous.is_none());
+        assert!(!set.accepts("old-key"));
+
+        let entries = audit.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].old_key_id, "old-key");
+        assert_eq!(entries[0].new_key_id, "new-key");
+        assert_eq!(entries[0].actor, "ops");
+        assert_eq!(entries[0].outcome, RotationOutcome::Completed);
+
+        // The revoked credential can no longer deliver.
+        let provider = MockProvider::default();
+        let revoked = CredentialSet::single(cred("old-key", CredentialState::Revoked));
+        assert!(deliver_with_credentials(&provider, &revoked, "0xabc", "hi").is_err());
+        assert!(provider.delivered().is_empty());
+
+        // The replacement credential delivers.
+        assert!(deliver_with_credentials(&provider, &set, "0xabc", "hi").is_ok());
+        assert_eq!(provider.delivered().len(), 1);
+    }
+
+    #[test]
+    fn dual_key_transition_retains_old_key_only_when_supported() {
+        let audit = InMemoryRotationAudit::new();
+        let mut set = CredentialSet::single(cred("old-key", CredentialState::Active));
+        set.dual_key = DualKeySupport::Supported;
+
+        let outcome =
+            rotate_credential(&mut set, cred("new-key", CredentialState::Active), "ops", &audit)
+                .expect("rotation succeeds");
+        assert_eq!(outcome, RotationOutcome::DualKeyTransition);
+        assert_eq!(set.active.key_id, "new-key");
+        assert_eq!(set.previous.as_ref().unwrap().key_id, "old-key");
+        assert_eq!(set.previous.as_ref().unwrap().state, CredentialState::Retired);
+        assert!(set.accepts("old-key"));
+        assert!(set.accepts("new-key"));
+
+        let entries = audit.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, RotationOutcome::DualKeyTransition);
+    }
+
+    #[test]
+    fn rejected_rotation_is_audited() {
+        let audit = InMemoryRotationAudit::new();
+        let mut set = CredentialSet::single(cred("old-key", CredentialState::Active));
+
+        let result =
+            rotate_credential(&mut set, cred("old-key", CredentialState::Active), "ops", &audit);
+        assert_eq!(result, Err(RotationError::SameCredential));
+        assert_eq!(set.active.key_id, "old-key");
+
+        let entries = audit.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, RotationOutcome::Rejected);
+        assert!(entries[0].detail.is_some());
     }
 }

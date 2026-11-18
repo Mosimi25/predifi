@@ -3,6 +3,26 @@
  *
  * Thin wrapper around `GET /api/v1/leaderboard` and
  * `GET /api/v1/pools/{id}/leaderboard`.
+ *
+ * Data ownership (see docs/data-ownership-matrix.md):
+ * - `user_address`, `rank`, `total_volume`, `prediction_count`, `wins`,
+ *   `settled_count`, `win_rate`, `current_streak`, `total_winnings`,
+ *   `winning_predictions`, `total_predictions` are owned by the indexer
+ *   (derived from on-chain events). The API is a pass-through; the UI must
+ *   not recompute them.
+ * - `rank` is owned by the API (computed at query time from the requested
+ *   `rank_by`/`period`). It is not stable across queries and must never be
+ *   cached or merged across different `rank_by` values.
+ * - `win_rate` is a derived ratio (indexer-owned). When `settled_count` is
+ *   zero the API returns `0`, not `null`; the UI must render `0%` rather
+ *   than a placeholder.
+ *
+ * Fallback / conflict behavior:
+ * - On HTTP error or invalid shape, callers surface an error state; there is
+ *   no client-side fallback to stale or locally computed values.
+ * - If a response mixes entry shapes (legacy winnings vs. volume rows), the
+ *   global validator accepts both; consumers must branch on the presence of
+ *   `total_winnings` before reading winnings fields.
  */
 import { API_BASE_URL } from "@/lib/api/pools";
 
@@ -31,7 +51,7 @@ export interface WinningsLeaderboardEntry {
   rank: number;
 }
 
-interface LeaderboardResponse<T> {
+export interface LeaderboardResponse<T> {
   leaderboard: T[];
   rank_by: string;
   period?: string;
@@ -40,7 +60,7 @@ interface LeaderboardResponse<T> {
 }
 
 /** Type guard to validate LeaderboardEntry shape. */
-function isLeaderboardEntry(obj: unknown): obj is LeaderboardEntry {
+export function isLeaderboardEntry(obj: unknown): obj is LeaderboardEntry {
   if (!obj || typeof obj !== "object") return false;
   const entry = obj as Record<string, unknown>;
   return (
@@ -56,7 +76,7 @@ function isLeaderboardEntry(obj: unknown): obj is LeaderboardEntry {
 }
 
 /** Type guard to validate WinningsLeaderboardEntry shape. */
-function isWinningsLeaderboardEntry(obj: unknown): obj is WinningsLeaderboardEntry {
+export function isWinningsLeaderboardEntry(obj: unknown): obj is WinningsLeaderboardEntry {
   if (!obj || typeof obj !== "object") return false;
   const entry = obj as Record<string, unknown>;
   return (
@@ -114,7 +134,7 @@ async function unwrap<T>(
 }
 
 /** Type validator for global leaderboard responses. */
-function isGlobalLeaderboardResponse(
+export function isGlobalLeaderboardResponse(
   obj: unknown,
 ): obj is LeaderboardResponse<LeaderboardEntry | WinningsLeaderboardEntry> {
   return (
@@ -125,7 +145,9 @@ function isGlobalLeaderboardResponse(
 }
 
 /** Type validator for pool leaderboard responses. */
-function isPoolLeaderboardResponse(obj: unknown): obj is LeaderboardResponse<LeaderboardEntry> {
+export function isPoolLeaderboardResponse(
+  obj: unknown,
+): obj is LeaderboardResponse<LeaderboardEntry> {
   return isLeaderboardResponse(obj, isLeaderboardEntry);
 }
 

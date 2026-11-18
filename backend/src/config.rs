@@ -346,6 +346,24 @@ fn json_u64_field(raw: &str, key: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
+// ── Database connection budget (issue #353) ──────────────────────────────────
+/// Default PostgreSQL server-side connection limit (`max_connections`).
+const DEFAULT_DB_SERVER_MAX_CONNECTIONS: u32 = 100;
+/// Default number of connections reserved for administration (superuser,
+/// migrations, monitoring, `psql` sessions) and left out of the service budget.
+const DEFAULT_DB_ADMIN_HEADROOM_CONNECTIONS: u32 = 10;
+/// Default maximum number of backend replicas that may run concurrently.
+const DEFAULT_DB_MAX_REPLICAS: u32 = 1;
+/// Default number of connections each replica's pool may hold. Kept in sync
+/// with [`DEFAULT_DB_MAX_CONNECTIONS`] so the budget check is meaningful even
+/// when only the replica count is overridden.
+const DEFAULT_DB_POOL_SIZE_PER_REPLICA: u32 = DEFAULT_DB_MAX_CONNECTIONS;
+/// Default number of additional non-HTTP services (indexer, workers) that each
+/// hold their own pool and therefore consume from the same budget.
+const DEFAULT_DB_AUXILIARY_SERVICES: u32 = 0;
+/// Default number of connections each auxiliary service's pool may hold.
+const DEFAULT_DB_AUXILIARY_POOL_SIZE: u32 = DEFAULT_DB_MAX_CONNECTIONS;
+
 // ── Abuse-control defaults (issue #103) ──────────────────────────────────────
 /// Default number of market-creation requests a single wallet may make per
 /// abuse-control window.
@@ -384,6 +402,14 @@ const DEFAULT_RPC_PRIORITY_CLASSES: &str = "transaction,indexer,health";
 /// Default comma-separated provider fallback order. Empty means "use the
 /// configured `PREDIFI_STELLAR_RPC_URL` only".
 const DEFAULT_RPC_PROVIDER_FALLBACK_ORDER: &str = "";
+
+// ── Notification provider credentials (issue #355) ───────────────────────────
+/// Default notification provider endpoint. Empty means "no provider configured".
+const DEFAULT_NOTIFICATION_PROVIDER_URL: &str = "";
+/// Whether dual-key (previous + current) notification credentials may be used
+/// during a rotation (default `false`). Read from
+/// `PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED`.
+const DEFAULT_NOTIFICATION_DUAL_KEY_ENABLED: bool = false;
 
 /// Origins allowed by default when `CORS_ALLOWED_ORIGINS` is not set.
 pub const DEFAULT_CORS_ORIGINS: &[&str] = &[
@@ -579,6 +605,45 @@ pub struct Config {
     /// Maximum age (seconds) a manifest may have before it is considered
     /// stale. Read from `PREDIFI_CONTRACT_MANIFEST_MAX_AGE_SECS`.
     pub contract_manifest_max_age_secs: u64,
+
+    // ── Database connection budget (issue #353) ──────────────────────────────
+    /// PostgreSQL server-side connection limit (`max_connections`). Default
+    /// `100`. Read from `PREDIFI_DB_SERVER_MAX_CONNECTIONS`.
+    pub db_server_max_connections: u32,
+    /// Connections reserved for administration and left out of the service
+    /// budget (default `10`). Read from `PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS`.
+    pub db_admin_headroom_connections: u32,
+    /// Maximum number of backend replicas that may run concurrently (default
+    /// `1`). Read from `PREDIFI_DB_MAX_REPLICAS`.
+    pub db_max_replicas: u32,
+    /// Connections each replica's pool may hold (default `10`). Read from
+    /// `PREDIFI_DB_POOL_SIZE_PER_REPLICA`.
+    pub db_pool_size_per_replica: u32,
+    /// Number of additional non-HTTP services (indexer, workers) that each hold
+    /// their own pool (default `0`). Read from `PREDIFI_DB_AUXILIARY_SERVICES`.
+    pub db_auxiliary_services: u32,
+    /// Connections each auxiliary service's pool may hold (default `10`). Read
+    /// from `PREDIFI_DB_AUXILIARY_POOL_SIZE`.
+    pub db_auxiliary_pool_size: u32,
+
+    // ── Notification provider credentials (issue #355) ───────────────────────
+    /// Base URL of the notification provider (default empty → no provider).
+    /// Read from `PREDIFI_NOTIFICATION_PROVIDER_URL`.
+    pub notification_provider_url: String,
+    /// Current (active) notification provider credential. Read from
+    /// `PREDIFI_NOTIFICATION_PROVIDER_KEY`. Must be non-empty whenever a
+    /// provider URL is configured; a revoked/empty key is rejected at startup.
+    pub notification_provider_key: String,
+    /// Optional previous notification provider credential, retained only while
+    /// a dual-key rotation is in flight. Read from
+    /// `PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY`. Only honoured when
+    /// [`Self::notification_dual_key_enabled`] is `true`.
+    pub notification_provider_previous_key: Option<String>,
+    /// Whether dual-key transition is permitted (default `false`). Read from
+    /// `PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED`. Must be explicitly enabled for
+    /// a previous key to be accepted; providers without dual-key semantics
+    /// must leave this disabled.
+    pub notification_dual_key_enabled: bool,
 }
 
 impl Config {
@@ -782,6 +847,56 @@ impl Config {
             DEFAULT_MANIFEST_MAX_AGE_SECS,
         )?;
 
+        // ── Database connection budget (issue #353) ──────────────────────────
+        let db_server_max_connections = get_u32(
+            vars,
+            "PREDIFI_DB_SERVER_MAX_CONNECTIONS",
+            DEFAULT_DB_SERVER_MAX_CONNECTIONS,
+        )?;
+        let db_admin_headroom_connections = get_u32(
+            vars,
+            "PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS",
+            DEFAULT_DB_ADMIN_HEADROOM_CONNECTIONS,
+        )?;
+        let db_max_replicas = get_u32(
+            vars,
+            "PREDIFI_DB_MAX_REPLICAS",
+            DEFAULT_DB_MAX_REPLICAS,
+        )?;
+        let db_pool_size_per_replica = get_u32(
+            vars,
+            "PREDIFI_DB_POOL_SIZE_PER_REPLICA",
+            DEFAULT_DB_POOL_SIZE_PER_REPLICA,
+        )?;
+        let db_auxiliary_services = get_u32(
+            vars,
+            "PREDIFI_DB_AUXILIARY_SERVICES",
+            DEFAULT_DB_AUXILIARY_SERVICES,
+        )?;
+        let db_auxiliary_pool_size = get_u32(
+            vars,
+            "PREDIFI_DB_AUXILIARY_POOL_SIZE",
+            DEFAULT_DB_AUXILIARY_POOL_SIZE,
+        )?;
+
+        // ── Notification provider credentials (issue #355) ───────────────────
+        let notification_provider_url = get_string(
+            vars,
+            "PREDIFI_NOTIFICATION_PROVIDER_URL",
+            DEFAULT_NOTIFICATION_PROVIDER_URL,
+        );
+        let notification_provider_key =
+            get_string(vars, "PREDIFI_NOTIFICATION_PROVIDER_KEY", "");
+        let notification_provider_previous_key = vars
+            .get("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let notification_dual_key_enabled = get_bool(
+            vars,
+            "PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED",
+            DEFAULT_NOTIFICATION_DUAL_KEY_ENABLED,
+        )?;
+
         if db_min_connections > db_max_connections {
             return Err(ConfigError::InvalidValue {
                 key: "PREDIFI_DB_MIN_CONNECTIONS",
@@ -840,6 +955,16 @@ impl Config {
             network_passphrase,
             contract_interface_version,
             contract_manifest_max_age_secs,
+            notification_provider_url,
+            notification_provider_key,
+            notification_provider_previous_key,
+            notification_dual_key_enabled,
+            db_server_max_connections,
+            db_admin_headroom_connections,
+            db_max_replicas,
+            db_pool_size_per_replica,
+            db_auxiliary_services,
+            db_auxiliary_pool_size,
         };
 
         config.validate()?;
@@ -1216,8 +1341,149 @@ impl Config {
                 ),
             });
         }
+        // ── Database connection budget (issue #353) ──────────────────────────
+        if self.db_server_max_connections == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_SERVER_MAX_CONNECTIONS",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.db_max_replicas == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_MAX_REPLICAS",
+                reason: String::from("must be at least one"),
+            });
+        }
+        if self.db_pool_size_per_replica == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_POOL_SIZE_PER_REPLICA",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.db_auxiliary_services > 0 && self.db_auxiliary_pool_size == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_AUXILIARY_POOL_SIZE",
+                reason: String::from(
+                    "must be greater than zero when PREDIFI_DB_AUXILIARY_SERVICES is set",
+                ),
+            });
+        }
+        // The admin headroom must leave at least one connection for the
+        // services themselves; otherwise the budget is unusable.
+        if self.db_admin_headroom_connections >= self.db_server_max_connections {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS",
+                reason: format!(
+                    "must be < PREDIFI_DB_SERVER_MAX_CONNECTIONS ({}), got {}",
+                    self.db_server_max_connections, self.db_admin_headroom_connections
+                ),
+            });
+        }
+                ),
+            });
+        }
+
+        // ── Notification provider credentials (issue #355) ───────────────────
+        let provider_url = self.notification_provider_url.trim();
+        if !provider_url.is_empty() {
+            validate_url_scheme(
+                provider_url,
+                "PREDIFI_NOTIFICATION_PROVIDER_URL",
+                &["http://", "https://"],
+            )?;
+            validate_url_has_host(provider_url, "PREDIFI_NOTIFICATION_PROVIDER_URL")?;
+        }
+
+        // A configured provider must always have a live credential. An empty
+        // key means the credential was revoked (or never provisioned) and must
+        // fail fast rather than silently dropping notifications.
+        if !provider_url.is_empty() && self.notification_provider_key.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_KEY",
+                reason: String::from(
+                    "must be set to a non-empty credential when \
+                     PREDIFI_NOTIFICATION_PROVIDER_URL is configured; \
+                     a revoked or empty key is rejected",
+                ),
+            });
+        }
+
+        // Dual-key transition is opt-in only. A previous key without explicit
+        // opt-in is a misconfiguration (the provider may not support it).
+        if self.notification_provider_previous_key.is_some() && !self.notification_dual_key_enabled {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
+                reason: String::from(
+                    "a previous credential requires PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED=true; \
+                     dual-key transition must be explicitly allowed",
+                ),
+            });
+        }
+
+        // The previous key must differ from the current key — otherwise the
+        // rotation has not actually happened.
+        if let Some(previous) = &self.notification_provider_previous_key {
+            if previous.trim() == self.notification_provider_key.trim() {
+                return Err(ConfigError::InvalidValue {
+                    key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
+                    reason: String::from(
+                        "must differ from PREDIFI_NOTIFICATION_PROVIDER_KEY during a rotation",
+                    ),
+                });
+            }
+        }
+
+        let budget = self.db_connection_budget();
+        if budget.required_connections > budget.available_connections {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_MAX_REPLICAS",
+                reason: format!(
+                    "unsafe database connection budget: {} replicas x {} pool + {} auxiliary x {} \
+                     = {} connections required, but only {} available after reserving {} of {} \
+                     for administration; reduce PREDIFI_DB_POOL_SIZE_PER_REPLICA, \
+                     PREDIFI_DB_MAX_REPLICAS or PREDIFI_DB_AUXILIARY_SERVICES, or raise \
+                     PREDIFI_DB_SERVER_MAX_CONNECTIONS",
+                    self.db_max_replicas,
+                    self.db_pool_size_per_replica,
+                    self.db_auxiliary_services,
+                    self.db_auxiliary_pool_size,
+                    budget.required_connections,
+                    budget.available_connections,
+                    self.db_admin_headroom_connections,
+                    self.db_server_max_connections
+                ),
+            });
+        }
 
         Ok(())
+    }
+
+    /// Compute the global database connection budget (issue #353).
+    ///
+    /// The budget accounts for every pool that may connect to PostgreSQL at
+    /// peak replica count: the HTTP replicas plus any auxiliary services
+    /// (indexer, workers) that hold their own pool. Administration headroom is
+    /// subtracted from the server limit before comparing.
+    pub fn db_connection_budget(&self) -> DbConnectionBudget {
+        let replica_connections = self
+            .db_max_replicas
+            .saturating_mul(self.db_pool_size_per_replica);
+        let auxiliary_connections = self
+            .db_auxiliary_services
+            .saturating_mul(self.db_auxiliary_pool_size);
+        let required_connections = replica_connections.saturating_add(auxiliary_connections);
+        let available_connections = self
+            .db_server_max_connections
+            .saturating_sub(self.db_admin_headroom_connections);
+
+        DbConnectionBudget {
+            server_max_connections: self.db_server_max_connections,
+            admin_headroom_connections: self.db_admin_headroom_connections,
+            available_connections,
+            replica_connections,
+            auxiliary_connections,
+            required_connections,
+        }
     }
 
     /// Return the `host:port` string used to bind the TCP listener.
@@ -1289,7 +1555,45 @@ impl Config {
             network_passphrase: String::from(DEFAULT_NETWORK_PASSPHRASE),
             contract_interface_version: DEFAULT_CONTRACT_INTERFACE_VERSION,
             contract_manifest_max_age_secs: DEFAULT_MANIFEST_MAX_AGE_SECS,
+            notification_provider_url: String::from(DEFAULT_NOTIFICATION_PROVIDER_URL),
+            notification_provider_key: String::new(),
+            notification_provider_previous_key: None,
+            notification_dual_key_enabled: DEFAULT_NOTIFICATION_DUAL_KEY_ENABLED,
+            db_server_max_connections: DEFAULT_DB_SERVER_MAX_CONNECTIONS,
+            db_admin_headroom_connections: DEFAULT_DB_ADMIN_HEADROOM_CONNECTIONS,
+            db_max_replicas: DEFAULT_DB_MAX_REPLICAS,
+            db_pool_size_per_replica: DEFAULT_DB_POOL_SIZE_PER_REPLICA,
+            db_auxiliary_services: DEFAULT_DB_AUXILIARY_SERVICES,
+            db_auxiliary_pool_size: DEFAULT_DB_AUXILIARY_POOL_SIZE,
         }
+    }
+}
+
+/// Snapshot of the global database connection budget (issue #353).
+///
+/// Produced by [`Config::db_connection_budget`] and used both by startup
+/// validation and by deployment checks to verify that the calculated maximum
+/// connection count stays within the PostgreSQL server limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbConnectionBudget {
+    /// PostgreSQL server-side connection limit (`max_connections`).
+    pub server_max_connections: u32,
+    /// Connections reserved for administration and excluded from the budget.
+    pub admin_headroom_connections: u32,
+    /// Connections available to services after subtracting admin headroom.
+    pub available_connections: u32,
+    /// Connections consumed by all HTTP replicas at peak replica count.
+    pub replica_connections: u32,
+    /// Connections consumed by auxiliary services at peak replica count.
+    pub auxiliary_connections: u32,
+    /// Total connections required at peak replica count.
+    pub required_connections: u32,
+}
+
+impl DbConnectionBudget {
+    /// `true` when the calculated maximum fits within the available budget.
+    pub fn is_within_limit(&self) -> bool {
+        self.required_connections <= self.available_connections
     }
 }
 
@@ -3429,10 +3733,108 @@ mod tests {
     #[test]
     fn config_rejects_empty_manifest_path() {
         let vars = HashMap::from([(String::from(MANIFEST_PATH_ENV), String::new())]);
+        ass
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn db_budget_accepts_exact_limit() {
+        // 9 replicas x 10 = 90 == 100 - 10 available.
+        let config = Config {
+            db_server_max_connections: 100,
+            db_admin_headroom_connections: 10,
+            db_max_replicas: 9,
+            db_pool_size_per_replica: 10,
+            db_auxiliary_services: 0,
+            ..Config::default_for_test()
+        };
+        config
+            .validate()
+            .expect("configuration exactly at the limit must be accepted");
+    }
+
+    #[test]
+    fn db_budget_rejects_headroom_covering_whole_limit() {
+        let config = Config {
+            db_server_max_connections: 100,
+            db_admin_headroom_connections: 100,
+            ..Config::default_for_test()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn db_budget_rejects_zero_replicas() {
+        let config = Config {
+            db_max_replicas: 0,
+            ..Config::default_for_test()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_MAX_REPLICAS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn db_budget_rejects_zero_auxiliary_pool_when_services_configured() {
+        let config = Config {
+            db_auxiliary_services: 2,
+            db_auxiliary_pool_size: 0,
+            ..Config::default_for_test()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_AUXILIARY_POOL_SIZE",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn db_budget_rejects_non_numeric_replicas() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_DB_MAX_REPLICAS"),
+            String::from("many"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidNumber {
+                key: "PREDIFI_DB_MAX_REPLICAS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn config_rejects_empty_manifest_path() {
+        let vars = HashMap::from([(String::from(MANIFEST_PATH_ENV), String::new())]);
         assert!(matches!(
             Config::from_map(&vars),
             Err(ConfigError::InvalidValue {
                 key: MANIFEST_PATH_ENV,
+                ..
+            })
+        ));
+    }
+
+    #[test]
                 ..
             })
         ));
@@ -3463,4 +3865,64 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn notification_provider_ignores_blank_previous_key() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("https://notify.example.com"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("new-key"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
+                String::from("   "),
+            ),
+        ]);
+        let config = Config::from_map(&vars).expect("blank previous key should be ignored");
+        assert_eq!(config.notification_provider_previous_key, None);
+    }
+
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn notification_provider_ignores_blank_previous_key() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("https://notify.example.com"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("new-key"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
+                String::from("   "),
+            ),
+        ]);
+        let config = Config::from_map(&vars).unwrap();
+        assert!(config.notification_provider_previous_key.is_none());
+    }
+
+    #[test]
+    fn db_budget_rejects_non_numeric_replicas() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_DB_MAX_REPLICAS"),
+            String::from("many"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidNumber {
+                key: "PREDIFI_DB_MAX_REPLICAS",
+                ..
+            })
+        ));
+    }
+
 }

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateRelease } from '../scripts/validate-release.mjs';
+import { checkHandbookLinks } from '../scripts/check-handbook-links.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -69,5 +70,103 @@ describe('Release metadata and build provenance validation', () => {
       () => validateRelease(invalid),
       /unsupported client version/
     );
+  });
+
+  it('rejects release if build provenance metadata is missing', () => {
+    const invalid = JSON.parse(JSON.stringify(baseExample));
+    delete invalid.build.provenance;
+    assert.throws(
+      () => validateRelease(invalid),
+      /missing build provenance/
+    );
+  });
+
+  it('rejects release if dependency lockfile hash is missing', () => {
+    const invalid = JSON.parse(JSON.stringify(baseExample));
+    delete invalid.build.provenance.lockfile_sha256;
+    assert.throws(
+      () => validateRelease(invalid),
+      /missing dependency lockfile hash/
+    );
+  });
+
+  it('rejects release if dependency lockfile hash does not match the lockfile', () => {
+    const invalid = JSON.parse(JSON.stringify(baseExample));
+    invalid.build.provenance.lockfile_sha256 = '0'.repeat(64);
+    assert.throws(
+      () => validateRelease(invalid),
+      /lockfile hash mismatch/
+    );
+  });
+
+  it('rejects release if artifact digest does not match the recorded provenance digest', () => {
+    const invalid = JSON.parse(JSON.stringify(baseExample));
+    invalid.build.provenance.artifact_sha256 = '0'.repeat(64);
+    assert.throws(
+      () => validateRelease(invalid),
+      /artifact digest mismatch/
+    );
+  });
+
+  it('accepts a clean repeated build with identical artifact digests', () => {
+    const repeated = JSON.parse(JSON.stringify(baseExample));
+    repeated.build.provenance.repeated_build = {
+      artifact_sha256: baseExample.artifacts[0].sha256,
+      lockfile_sha256: baseExample.build.provenance.lockfile_sha256,
+    };
+    assert.doesNotThrow(() => {
+      validateRelease(repeated);
+    });
+  });
+
+  it('rejects release if a repeated clean build produces a different artifact digest', () => {
+    const invalid = JSON.parse(JSON.stringify(baseExample));
+    invalid.build.provenance.repeated_build = {
+      artifact_sha256: '0'.repeat(64),
+      lockfile_sha256: baseExample.build.provenance.lockfile_sha256,
+    };
+    assert.throws(
+      () => validateRelease(invalid),
+      /non-reproducible build/
+    );
+  });
+});
+
+describe('Maintainer handbook link check', () => {
+  it('passes when all handbook and runbook references resolve', () => {
+    const result = checkHandbookLinks({ root: ROOT });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.errors, []);
+    assert.ok(result.checked.length > 0, 'expected at least one reference to be checked');
+  });
+
+  it('fails with a clear error when a handbook reference is broken', () => {
+    const result = checkHandbookLinks({
+      root: ROOT,
+      overrides: {
+        'docs/handbook/maintainer-handbook.md': [
+          { target: 'docs/handbook/does-not-exist.md', source: 'docs/handbook/maintainer-handbook.md' },
+        ],
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.errors.length, 1);
+    assert.match(result.errors[0], /docs\/handbook\/does-not-exist\.md/);
+    assert.match(result.errors[0], /maintainer-handbook\.md/);
+  });
+
+  it('fails with a clear error when a runbook reference is broken', () => {
+    const result = checkHandbookLinks({
+      root: ROOT,
+      overrides: {
+        'docs/handbook/incident-runbook.md': [
+          { target: 'docs/handbook/missing-runbook.md', source: 'docs/handbook/incident-runbook.md' },
+        ],
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.errors.length, 1);
+    assert.match(result.errors[0], /docs\/handbook\/missing-runbook\.md/);
+    assert.match(result.errors[0], /incident-runbook\.md/);
   });
 });

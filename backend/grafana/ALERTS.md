@@ -3,8 +3,8 @@
 This document details the alert rules configured for the PrediFi monitoring stack across Prometheus and Grafana.
 
 All alerts are provisioned strictly as code:
-- **Prometheus Alert Rules**: [`backend/grafana/alerts/predifi_alerts.yml`](file:///Users/mac/Documents/OPENSOURCE/Drips/zaps/predifi/backend/grafana/alerts/predifi_alerts.yml) (and Terraform deployment via [`terraform/modules/monitoring/main.tf`](file:///Users/mac/Documents/OPENSOURCE/Drips/zaps/predifi/terraform/modules/monitoring/main.tf)).
-- **Grafana Provisioned Rules**: [`docker/grafana/provisioning/alerting/rules.yaml`](file:///Users/mac/Documents/OPENSOURCE/Drips/zaps/predifi/docker/grafana/provisioning/alerting/rules.yaml).
+- **Prometheus Alert Rules**: [`backend/grafana/alerts/predifi_alerts.yml`](alerts/predifi_alerts.yml) (and Terraform deployment via [`terraform/modules/monitoring/main.tf`](../../terraform/modules/monitoring/main.tf)).
+- **Grafana Provisioned Rules**: [`docker/grafana/provisioning/alerting/rules.yaml`](../../docker/grafana/provisioning/alerting/rules.yaml).
 
 - **SLO recording rules and burn-rate alerts**: [`backend/grafana/alerts/predifi_slo_rules.yml`](alerts/predifi_slo_rules.yml), defined in [`docs/observability/slos.md`](../../docs/observability/slos.md).
 
@@ -17,6 +17,33 @@ mitigation, verification, rollback, escalation) live in
 threshold was chosen. CI (`.github/workflows/alert-runbooks.yml`) rejects a
 rule without an owner or a working runbook link.
 
+### On-call ownership map
+
+Each production alert is assigned to a service owner and an escalation path,
+with severity, expected response time, fallback owner, and runbook. The
+authoritative map is maintained in
+[`docs/runbooks/ownership.md`](../../docs/runbooks/ownership.md); the table
+below mirrors it for quick reference.
+
+| Alert | Service owner | Escalation path | Severity | Expected response | Fallback owner | Runbook |
+|---|---|---|---|---|---|---|
+| `HighApiErrorRate` | API Platform (`@predifi/api-oncall`) | API on-call → Platform lead → CTO | `critical` | 15 min | Core Backend (`@predifi/backend-oncall`) | [`api-error-rate.md`](../../docs/runbooks/api-error-rate.md) |
+| `HighP99Latency` | API Platform (`@predifi/api-oncall`) | API on-call → Platform lead | `warning` | 1 hour | Core Backend (`@predifi/backend-oncall`) | [`high-latency.md`](../../docs/runbooks/high-latency.md) |
+| `WorkerQueueBacklog` | Data Pipeline (`@predifi/data-oncall`) | Data on-call → Platform lead | `warning` | 1 hour | Core Backend (`@predifi/backend-oncall`) | [`worker-queue-backlog.md`](../../docs/runbooks/worker-queue-backlog.md) |
+| `WorkerDLQBacklog` | Data Pipeline (`@predifi/data-oncall`) | Data on-call → Platform lead → CTO | `critical` | 15 min | Core Backend (`@predifi/backend-oncall`) | [`worker-dlq-backlog.md`](../../docs/runbooks/worker-dlq-backlog.md) |
+| `DatabaseConnectionPoolSaturated` | Database (`@predifi/db-oncall`) | DB on-call → Platform lead | `warning` | 1 hour | API Platform (`@predifi/api-oncall`) | [`db-pool-saturated.md`](../../docs/runbooks/db-pool-saturated.md) |
+| `DatabaseConnectionPoolCritical` | Database (`@predifi/db-oncall`) | DB on-call → Platform lead → CTO | `critical` | 15 min | API Platform (`@predifi/api-oncall`) | [`db-pool-critical.md`](../../docs/runbooks/db-pool-critical.md) |
+| `DatabaseQueryFailures` | Database (`@predifi/db-oncall`) | DB on-call → Platform lead | `critical` | 15 min | API Platform (`@predifi/api-oncall`) | [`db-query-failures.md`](../../docs/runbooks/db-query-failures.md) |
+| `HighRedisErrors` | Platform Infrastructure (`@predifi/infra-oncall`) | Infra on-call → Platform lead | `warning` | 1 hour | API Platform (`@predifi/api-oncall`) | [`redis-errors.md`](../../docs/runbooks/redis-errors.md) |
+| `ContractInteractionFailures` | Smart Contracts (`@predifi/contracts-oncall`) | Contracts on-call → Platform lead → CTO | `critical` | 15 min | Core Backend (`@predifi/backend-oncall`) | [`contract-interaction-failures.md`](../../docs/runbooks/contract-interaction-failures.md) |
+| `BackendMemoryHigh` | Platform Infrastructure (`@predifi/infra-oncall`) | Infra on-call → Platform lead | `critical` | 15 min | Core Backend (`@predifi/backend-oncall`) | [`backend-memory-high.md`](../../docs/runbooks/backend-memory-high.md) |
+
+Release checks (`.github/workflows/alert-runbooks.yml`) audit every alert
+definition and **fail validation** when an alert is missing its `owner` label,
+its `runbook_url` annotation, or when the runbook link does not resolve. The
+same check verifies that each alert appears in the ownership map above with a
+fallback owner and escalation path.
+
 ---
 
 ## Core Golden Signal Alerts
@@ -28,6 +55,9 @@ rule without an owner or a working runbook link.
   (sum(rate(app_http_requests_total{status=~"5.."}[5m])) / sum(rate(app_http_requests_total[5m]))) * 100 > 1
   ```
 - **Severity**: `critical`
+- **Owner / escalation / fallback**: API Platform → Platform lead → CTO; fallback Core Backend (see [ownership map](#on-call-ownership-map))
+- **Expected response**: 15 min
+- **Runbook**: [`api-error-rate.md`](../../docs/runbooks/api-error-rate.md)
 - **Threshold**: `> 1%` over 5 minutes (evaluated for 2 minutes)
 - **Rationale**:
   In a production financial and prediction market platform, HTTP 5xx responses represent unhandled application errors, database disconnections, or backend panics. A sustained error rate greater than 1% indicates a critical failure mode that directly disrupts users placing predictions or claiming payouts. The 2-minute duration avoids alerting on momentary transient spikes during deploys while quickly triggering on real regressions.
@@ -45,6 +75,9 @@ rule without an owner or a working runbook link.
   histogram_quantile(0.99, sum(rate(app_http_request_duration_seconds_bucket[5m])) by (le)) > 0.5
   ```
 - **Severity**: `warning`
+- **Owner / escalation / fallback**: API Platform → Platform lead; fallback Core Backend (see [ownership map](#on-call-ownership-map))
+- **Expected response**: 1 hour
+- **Runbook**: [`high-latency.md`](../../docs/runbooks/high-latency.md)
 - **Threshold**: `> 500ms` (0.5s) at the 99th percentile over 5 minutes (evaluated for 3 minutes)
 - **Rationale**:
   Prediction markets require near real-time execution. When 99% of requests exceed 500ms, user interface responsiveness degrades noticeably, and automated traders face slippage and stale odds. A 3-minute sustained window ensures that isolated long-running export queries do not trigger false positives, while persistent slowdowns from unindexed database queries or slow Soroban RPC calls are surfaced.
@@ -63,6 +96,9 @@ rule without an owner or a working runbook link.
   app_worker_queue_depth > 50
   ```
 - **Severity**: `warning`
+- **Owner / escalation / fallback**: Data Pipeline → Platform lead; fallback Core Backend (see [ownership map](#on-call-ownership-map))
+- **Expected response**: 1 hour
+- **Runbook**: [`worker-queue-backlog.md`](../../docs/runbooks/worker-queue-backlog.md)
 - **Threshold**: `> 50` pending/retrying jobs (evaluated for 3 minutes)
 - **Rationale**:
   The background worker pipeline handles asynchronous event ingestion from the Stellar network, payout disbursements, and pool resolution updates. Under steady state, jobs are processed within milliseconds of enqueueing. A backlog greater than 50 jobs lasting more than 3 minutes indicates worker starvation, upstream RPC throttling, or excessive retry loops.
@@ -77,6 +113,9 @@ rule without an owner or a working runbook link.
   app_worker_dlq_depth > 10
   ```
 - **Severity**: `critical`
+- **Owner / escalation / fallback**: Data Pipeline → Platform lead → CTO; fallback Core Backend (see [ownership map](#on-call-ownership-map))
+- **Expected response**: 15 min
+- **Runbook**: [`worker-dlq-backlog.md`](../../docs/runbooks/worker-dlq-backlog.md)
 - **Threshold**: `> 10` dead-lettered jobs (evaluated for 2 minutes)
 - **Rationale**:
   Jobs reach the dead-letter queue (DLQ) only after exhausting their retry budget (e.g. 5 consecutive attempts). Accumulation of more than 10 dead-lettered jobs indicates persistent failure (e.g. malformed contract events, invalid transaction signatures, or invariant violations) that requires manual operator review and replay via `/worker/requeue`.
@@ -95,6 +134,9 @@ rule without an owner or a working runbook link.
   db_pool_utilization_ratio > 0.8
   ```
 - **Severity**: `warning`
+- **Owner / escalation / fallback**: Database → Platform lead; fallback API Platform (see [ownership map](#on-call-ownership-map))
+- **Expected response**: 1 hour
+- **Runbook**: [`db-pool-saturated.md`](../../docs/runbooks/db-pool-saturated.md)
 - **Threshold**: `> 80%` (0.8) connection pool utilization (evaluated for 2 minutes)
 - **Rationale**:
   The PostgreSQL connection pool (`sqlx::PgPool`) has a fixed capacity to protect the database instance from connection exhaustion. When active connections exceed 80% of capacity for 2 minutes, the pool is running low on headroom. Concurrency spikes will cause incoming queries to block, increasing latency across all HTTP routes. Triggering at 80% gives operators advance warning to inspect connection leaks or scale pool capacity.
@@ -105,6 +147,9 @@ rule without an owner or a working runbook link.
   db_pool_utilization_ratio > 0.95
   ```
 - **Severity**: `critical`
+- **Owner / escalation / fallback**: Database → Platform lead → CTO; fallback API Platform (see [ownership map](#on-call-ownership-map))
+- **Expected response**: 15 min
+- **Runbook**: [`db-pool-critical.md`](../../docs/runbooks/db-pool-critical.md)
 - **Threshold**: `> 95%` (0.95) connection pool utilization (evaluated for 1 minute)
 - **Rationale**:
   At >95% saturation, the pool is virtually exhausted. New HTTP requests requiring database access will immediately encounter connection checkout timeouts (default 30s) and return 500 errors. An immediate 1-minute alert triggers fast auto-scaling or traffic mitigation.
@@ -117,9 +162,13 @@ rule without an owner or a working runbook link.
 
 ## Auxiliary Reliability Alerts
 
-| Alert | Condition | Severity | Rationale |
-|---|---|---|---|
-| `DatabaseQueryFailures` | `sum(rate(app_db_queries_total{result="error"}[5m])) > 5` | `critical` | Spikes in database query errors point to schema mismatches, disk exhaustion, or deadlocks. |
-| `HighRedisErrors` | `sum(rate(app_redis_operations_total{result="error"}[5m])) > 10` | `warning` | Redis failures cause session lookup fallbacks, cache misses, and degraded throughput. |
-| `ContractInteractionFailures` | `sum(rate(app_db_queries_total{query_type=~".*contract.*",result="error"}[5m])) > 0` | `critical` | Soroban smart contract interaction errors risk halting betting and settlement workflows. |
-| `BackendMemoryHigh` | `(app_memory_used_bytes / app_memory_total_bytes) * 100 > 90` | `critical` | Memory utilization above 90% risks process termination by Linux Out-Of-Memory (OOM) killer. |
+| Alert | Condition | Severity | Owner (escalation / fallback) | Expected response | Runbook | Rationale |
+|---|---|---|---|---|---|---|
+| `DatabaseQueryFailures` | `sum(rate(app_db_queries_total{result="error"}[5m])) > 5` | `critical` | Database → Platform lead; fallback API Platform | 15 min | [`db-query-failures.md`](../../docs/runbooks/db-query-failures.md) | Spikes in database query errors point to schema mismatches, disk exhaustion, or deadlocks. |
+| `HighRedisErrors` | `sum(rate(app_redis_operations_total{result="error"}[5m])) > 10` | `warning` | Platform Infrastructure → Platform lead; fallback API Platform | 1 hour | [`redis-errors.md`](../../docs/runbooks/redis-errors.md) | Redis failures cause session lookup fallbacks, cache misses, and degraded throughput. |
+| `ContractInteractionFailures` | `sum(rate(app_db_queries_total{query_type=~".*contract.*",result="error"}[5m])) > 0` | `critical` | Smart Contracts → Platform lead → CTO; fallback Core Backend | 15 min | [`contract-interaction-failures.md`](../../docs/runbooks/contract-interaction-failures.md) | Soroban smart contract interaction errors risk halting betting and settlement workflows. |
+| `BackendMemoryHigh` | `(app_memory_used_bytes / app_memory_total_bytes) * 100 > 90` | `critical` | Platform Infrastructure → Platform lead; fallback Core Backend | 15 min | [`backend-memory-high.md`](../../docs/runbooks/backend-memory-high.md) | Memory utilization above 90% risks process termination by Linux Out-Of-Memory (OOM) killer. |
+
+See the [on-call ownership map](#on-call-ownership-map) for the full owner,
+escalation, and fallback assignments; CI fails when any alert is missing owner
+or runbook metadata.

@@ -136,3 +136,116 @@ pub async fn process_event(state: Arc<IndexerState>, event: IndexedEvent) -> any
     invalidate_market_views(&state, &event).await;
     Ok(())
 }
+
+/// Contract tests for indexer-derived fields.
+///
+/// Per the data ownership matrix, the indexer is the source of truth for
+/// lifecycle state (market status transitions) and on-chain balances/volume
+/// aggregates. These tests pin the freshness/fallback contract:
+/// - every lifecycle/balance-affecting event invalidates the derived views,
+/// - the TTL fallback bounds staleness when invalidation is missed,
+/// - invalidation is idempotent so replayed events are safe.
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    fn prediction_created(market_id: &str) -> IndexedEvent {
+        IndexedEvent::PredictionCreated {
+            market_id: market_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn market_resolved(market_id: &str) -> IndexedEvent {
+        IndexedEvent::MarketResolved {
+            market_id: market_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn market_cancelled(market_id: &str) -> IndexedEvent {
+        IndexedEvent::MarketCancelled {
+            market_id: market_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn market_metadata_updated(market_id: &str) -> IndexedEvent {
+        IndexedEvent::MarketMetadataUpdated {
+            market_id: market_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Lifecycle events must invalidate both the detail view (status) and the
+    /// list views (status/activity) so the indexer remains the source of truth.
+    #[test]
+    fn lifecycle_events_invalidate_detail_and_list_views() {
+        for event in [
+            market_resolved("m1"),
+            market_cancelled("m1"),
+            market_metadata_updated("m1"),
+        ] {
+            let keys = affected_cache_keys(&event);
+            assert!(
+                keys.contains(&market_detail_key("m1")),
+                "lifecycle event must invalidate market detail view"
+            );
+            for list_key in market_list_keys("m1") {
+                assert!(
+                    keys.contains(&list_key),
+                    "lifecycle event must invalidate list view {list_key}"
+                );
+            }
+        }
+    }
+
+    /// Balance/volume aggregates change on new predictions, so the derived
+    /// views must be invalidated to keep the indexer authoritative.
+    #[test]
+    fn balance_affecting_events_invalidate_aggregate_views() {
+        let keys = affected_cache_keys(&prediction_created("m2"));
+        assert!(keys.contains(&market_detail_key("m2")));
+        assert!(keys.contains(&"market:list:all".to_string()));
+        assert!(keys.contains(&"market:list:active".to_string()));
+        assert!(keys.contains(&"market:list:by-id:m2".to_string()));
+    }
+
+    /// The TTL fallback must be a positive, bounded value so a missed
+    /// invalidation cannot leave stale indexer-derived fields indefinitely.
+    #[test]
+    fn ttl_fallback_is_bounded() {
+        assert!(MARKET_CACHE_TTL_SECS > 0, "TTL fallback must be positive");
+        assert!(
+            MARKET_CACHE_TTL_SECS <= 600,
+            "TTL fallback must bound staleness to a small window"
+        );
+    }
+
+    /// Invalidation must be idempotent: replaying the same event yields the
+    /// same key set, so duplicate events cannot corrupt derived state.
+    #[test]
+    fn invalidation_is_idempotent_for_replayed_events() {
+        let event = market_resolved("m3");
+        let first = affected_cache_keys(&event);
+        let second = affected_cache_keys(&event);
+        assert_eq!(first, second);
+    }
+
+    /// Every indexed event must map to at least one invalidated key, otherwise
+    /// indexer-derived fields could silently go stale.
+    #[test]
+    fn every_event_invalidates_some_view() {
+        for event in [
+            prediction_created("m4"),
+            market_resolved("m4"),
+            market_cancelled("m4"),
+            market_metadata_updated("m4"),
+        ] {
+            assert!(
+                !affected_cache_keys(&event).is_empty(),
+                "every indexed event must invalidate at least one view"
+            );
+        }
+    }
+}

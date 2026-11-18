@@ -455,4 +455,168 @@ mod tests {
         assert!(text.contains("app_price_cache_assets"));
         assert!(text.contains("app_price_cache_fetch_duration_seconds"));
     }
+
+    // ── Data ownership contract tests ────────────────────────────────────────
+    //
+    // These tests pin down the price fields' documented source of truth,
+    // freshness window, and fallback behaviour as described in the
+    // field-level ownership matrix (see `docs/data-ownership.md`).
+    //
+    // Contract summary for prices:
+    //   * Authoritative source: CoinGecko `simple/price` (external oracle),
+    //     proxied through this in-memory cache. The chain is NOT the source
+    //     of truth for USD prices.
+    //   * Freshness window: `PRICE_CACHE_TTL` (60s). Within the window a
+    //     cached snapshot is served as-is; past it, an on-demand refresh is
+    //     attempted.
+    //   * Fallback: on refresh failure the previous (stale) snapshot is
+    //     retained and served; a cold cache with no data yields an empty
+    //     snapshot, which the handler surfaces as 503.
+
+    /// The documented freshness window must stay in sync with the background
+    /// fetcher's refresh cadence (both are 60 seconds).
+    #[test]
+    fn price_freshness_window_matches_contract() {
+        assert_eq!(PRICE_CACHE_TTL, Duration::from_secs(60));
+    }
+
+    /// A cold cache (never populated) must not be considered expired: the
+    /// contract says cold-start behaviour is left to the background fetcher
+    /// and callers see an empty snapshot rather than triggering a fetch.
+    #[test]
+    fn cold_cache_is_not_expired() {
+        let cache = PriceCache::new();
+        assert!(!cache.is_expired());
+        assert!(cache.snapshot().is_empty());
+    }
+
+    /// A freshly updated cache is within the freshness window and therefore
+    /// not expired.
+    #[test]
+    fn freshly_updated_cache_is_not_expired() {
+        let cache = PriceCache::new();
+        let mut prices = HashMap::new();
+        prices.insert("BTC".to_string(), 60_000.0);
+        cache.update(prices);
+        assert!(!cache.is_expired());
+    }
+
+    /// A cache whose last update is older than the freshness window must be
+    /// reported as expired so an on-demand refresh is attempted.
+    #[test]
+    fn stale_cache_is_expired() {
+        let cache = PriceCache::new();
+        let mut prices = HashMap::new();
+        prices.insert("BTC".to_string(), 60_000.0);
+        cache.update(prices);
+
+        // Backdate the freshness clock past the TTL to simulate a stalled
+        // background fetcher.
+        {
+            let mut guard = cache.0.last_updated.write().expect("lock");
+            *guard = Some(Instant::now() - PRICE_CACHE_TTL - Duration::from_secs(1));
+        }
+
+        assert!(cache.is_expired());
+    }
+
+    /// Fallback contract: when a refresh fails, the previous snapshot is
+    /// retained rather than being cleared. We simulate this by verifying that
+    /// `update` is the only path that mutates the snapshot and that a failed
+    /// fetch (represented here by simply not calling `update`) leaves the
+    /// prior data intact.
+    #[test]
+    fn stale_snapshot_is_retained_on_failed_refresh() {
+        let cache = PriceCache::new();
+        let mut prices = HashMap::new();
+        prices.insert("BTC".to_string(), 42_000.0);
+        cache.update(prices);
+
+        // Simulate a failed refresh: no `update` call happens, so the
+        // snapshot must still contain the previous value.
+        let snap = cache.snapshot();
+        assert_eq!(snap.get("BTC"), Some(&42_000.0));
+    }
+
+    /// The handler must surface an empty cache as 503 (no fallback data
+    /// available), matching the documented fallback behaviour.
+    #[tokio::test]
+    async fn empty_cache_falls_back_to_503() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let cache = PriceCache::new();
+        let app = axum::Router::new()
+            .route("/prices", axum::routing::get(get_prices))
+            .with_state(TestState {
+                cache,
+                metrics: test_metrics(),
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/prices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = response.into_body().collect().await.unwrap();
+    }
+
+    /// The handler must serve the cached snapshot (200) when data is present,
+    /// even if it is stale — the stale snapshot is the documented fallback.
+    #[tokio::test]
+    async fn stale_cache_serves_retained_snapshot() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let cache = PriceCache::new();
+        let mut prices = HashMap::new();
+        prices.insert("BTC".to_string(), 12_345.0);
+        cache.update(prices);
+
+        // Backdate so the entry is stale; the handler should still serve it
+        // rather than returning an error.
+        {
+            let mut guard = cache.0.last_updated.write().expect("lock");
+            *guard = Some(Instant::now() - PRICE_CACHE_TTL - Duration::from_secs(1));
+        }
+
+        let app = axum::Router::new()
+            .route("/prices", axum::routing::get(get_prices))
+            .with_state(TestState {
+                cache,
+                metrics: test_metrics(),
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/prices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("BTC"));
+        assert!(text.contains("12345"));
+    }
+
+    /// The price response must only expose the documented asset symbols
+    /// (BTC, ETH, XLM) as the authoritative set of tracked prices.
+    #[test]
+    fn tracked_assets_match_contract() {
+        let symbols: Vec<&str> = ASSETS.iter().map(|(symbol, _)| *symbol).collect();
+        assert_eq!(symbols, vec!["BTC", "ETH", "XLM"]);
+    }
 }

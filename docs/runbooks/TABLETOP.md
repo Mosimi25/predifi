@@ -60,6 +60,52 @@ the rollback and escalation path, without outside help.
   [api.md](api.md#highapierrorrate) → roll back after confirming schema
   compatibility → verify → file a bug.
 
+## Scenario 4 — Compromised notification provider credential
+
+- **Alert:** `NotificationProviderAuthFailure` (or a security report of a
+  leaked provider API key).
+- **Setup:** The notification provider API key used by the delivery worker is
+  believed compromised. The provider is a **test/mock provider** so the
+  exercise can be run end to end without touching production credentials.
+- **Clues to prepare:** Worker logs with `401 Unauthorized` from the provider;
+  the key's last-used timestamp; the audit/outbox entries for the last
+  successful rotation.
+- **Expected path:** [notifications.md](notifications.md#compromised-provider-credential)
+  → detect → revoke the old key at the provider → issue a replacement →
+  deploy the new key → verify delivery → confirm the revoked key can no longer
+  deliver → confirm the rotation event is in the audit log/outbox.
+
+### Credential-compromise recovery steps
+
+1. **Detect.** Confirm the credential is compromised (security report, leaked
+   key, or repeated provider `401`/`403` with a valid-looking key). Record the
+   time and the key identifier (never the secret) in the incident channel.
+2. **Revoke.** Disable/delete the old key at the provider console first. This
+   stops continued use immediately; expect delivery failures until the
+   replacement is deployed.
+3. **Replace.** Issue a new key with the minimum required scope. Store it in
+   the secret manager, not in the repo or the ticket.
+4. **Deploy.** Roll out the new key to the delivery worker via the normal
+   config/secret rollout. Restart workers so no process keeps the old key in
+   memory.
+5. **Verify.** Send a test notification through the worker and confirm it is
+   delivered. Then attempt delivery with the **revoked** key and confirm the
+   provider rejects it.
+6. **Audit.** Confirm the rotation event (who, when, which key id, old key
+   revoked, new key deployed) is recorded in the audit log/outbox. If the
+   provider supports it, also record the provider-side revocation.
+
+**Dual-key transition:** Only use an overlap window (old + new key both valid)
+where the provider's semantics permit it — i.e. the provider supports multiple
+active keys and lets you revoke one without invalidating the other. If the
+provider only allows a single active key, revoke-then-replace is mandatory and
+a short delivery gap is expected and acceptable. Never leave the old key valid
+after verification.
+
+**Pass criteria for this scenario:** The responder revokes before replacing,
+deploys the new key, verifies delivery, proves the revoked key cannot deliver,
+and shows the rotation event in the audit log/outbox.
+
 ## Exercise record
 
 | Field | Value |
@@ -74,3 +120,6 @@ the rollback and escalation path, without outside help.
 | Passed without outside help? | yes / no |
 | Runbook gaps found | |
 | Follow-up PRs | |
+
+For Scenario 4, also record: old key revoked at, new key deployed at, revoked
+key rejected by provider (yes/no), rotation event in audit log/outbox (yes/no).

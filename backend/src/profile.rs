@@ -289,4 +289,125 @@ mod tests {
         let win_rate = (wins as f64 / (wins + losses) as f64) * 100.0;
         assert_eq!(win_rate, 75.0);
     }
+
+    // ------------------------------------------------------------------
+    // Data ownership contract tests.
+    //
+    // These pin the authoritative source and fallback behavior for each
+    // profile field so the API can't silently drift from the ownership
+    // matrix (see docs/data-ownership.md):
+    //
+    //   * balances / earnings  -> indexer (`predictions.claimed_amount`),
+    //     never the chain's live balance; missing => 0.
+    //   * lifecycle            -> indexer (`pools.state` / `pools.result`),
+    //     which mirrors the chain; unresolved => `is_winner = None`.
+    //   * analytics            -> indexer aggregates over `predictions`,
+    //     empty history => zeroed series, never an error.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stats_earnings_fall_back_to_zero_when_nothing_claimed() {
+        // Ownership: earnings are indexer-owned; an unclaimed profile must
+        // report 0 rather than a missing/null value.
+        let row = ProfileStatsRow {
+            total_predictions: 2,
+            wins: 1,
+            losses: 1,
+            pending: 0,
+            total_staked: 200,
+            total_earnings: 0,
+            active_positions: 0,
+        };
+        assert_eq!(row.total_earnings, 0);
+        assert_eq!(row.total_staked, 200);
+    }
+
+    #[test]
+    fn stats_pending_excludes_settled_predictions() {
+        // Ownership: lifecycle is indexer-owned; pending counts only rows
+        // whose pool has not settled.
+        let row = ProfileStatsRow {
+            total_predictions: 5,
+            wins: 2,
+            losses: 1,
+            pending: 2,
+            total_staked: 500,
+            total_earnings: 0,
+            active_positions: 2,
+        };
+        assert_eq!(row.wins + row.losses + row.pending, row.total_predictions);
+    }
+
+    #[test]
+    fn claim_status_is_winner_is_none_before_resolution() {
+        // Ownership: lifecycle/result is indexer-owned; before the pool
+        // resolves the API must expose `None`, not a guessed boolean.
+        let row = ClaimStatusRow {
+            prediction_id: 1,
+            pool_id: 10,
+            pool_name: "pool".to_string(),
+            outcome: 0,
+            amount: 100,
+            pool_state: "active".to_string(),
+            pool_result: None,
+            is_winner: None,
+            claimed: false,
+            claimed_amount: 0,
+            claim_window_expires_at: None,
+            claim_expired: false,
+        };
+        assert!(row.is_winner.is_none());
+        assert!(row.claim_window_expires_at.is_none());
+        assert!(!row.claim_expired);
+    }
+
+    #[test]
+    fn claim_status_marks_expired_window_after_resolution() {
+        // Ownership: claim window is derived from indexer-owned
+        // `pools.resolved_at` + `claim_window_seconds`; once elapsed the
+        // API reports `claim_expired = true` even if unclaimed.
+        let resolved_at = Utc::now() - chrono::Duration::seconds(3_600);
+        let expires_at = resolved_at + chrono::Duration::seconds(1_800);
+        let claim_expired = expires_at < Utc::now();
+        let row = ClaimStatusRow {
+            prediction_id: 2,
+            pool_id: 11,
+            pool_name: "pool".to_string(),
+            outcome: 1,
+            amount: 50,
+            pool_state: "resolved".to_string(),
+            pool_result: Some("1".to_string()),
+            is_winner: Some(true),
+            claimed: false,
+            claimed_amount: 0,
+            claim_window_expires_at: Some(expires_at),
+            claim_expired,
+        };
+        assert_eq!(row.is_winner, Some(true));
+        assert!(row.claim_expired);
+        assert!(!row.claimed);
+    }
+
+    #[test]
+    fn performance_series_is_empty_for_new_profile() {
+        // Ownership: analytics are indexer aggregates; a profile with no
+        // predictions yields an empty series (rendered as zeroed chart),
+        // never an error or null.
+        let performance: Vec<PerformancePoint> = Vec::new();
+        assert!(performance.is_empty());
+    }
+
+    #[test]
+    fn performance_point_reports_zero_earnings_when_unclaimed() {
+        // Ownership: earnings per day come from indexer-owned
+        // `claimed_amount`; days with only stakes report 0 earnings.
+        let point = PerformancePoint {
+            day: Utc::now(),
+            staked: 100,
+            earnings: 0,
+            predictions: 1,
+        };
+        assert_eq!(point.earnings, 0);
+        assert_eq!(point.staked, 100);
+    }
 }

@@ -178,4 +178,72 @@ mod tests {
         };
         assert_eq!(key.canonical(), "testnet:CABC:42:deadbeef:3");
     }
+
+    // --- Data ownership contract tests (#356) -------------------------------
+    //
+    // Ownership matrix (see docs/data-ownership.md):
+    //   * `projected_contract_events` is the authoritative record of which
+    //     chain events have been projected. The chain is the source of truth
+    //     for event identity; the indexer never rewrites a claimed key.
+    //   * Domain rows (pools, predictions, resolutions) are derived from the
+    //     chain event and must reflect the chain values verbatim.
+    //   * Conflict behavior: a duplicate event key is a no-op — the first
+    //     projection wins and later conflicting payloads are ignored.
+
+    fn sample_key(event_index: u32) -> EventKey {
+        EventKey {
+            network: "testnet".into(),
+            contract_id: "CABC".into(),
+            ledger: 42,
+            tx_hash: "deadbeef".into(),
+            event_index,
+        }
+    }
+
+    #[test]
+    fn event_key_identity_is_stable_across_retries() {
+        // The same on-chain event must always produce the same canonical key,
+        // so retries and overlapping ledger windows dedupe to one projection.
+        let a = sample_key(3);
+        let b = sample_key(3);
+        assert_eq!(a, b);
+        assert_eq!(a.canonical(), b.canonical());
+    }
+
+    #[test]
+    fn distinct_event_positions_are_distinct_keys() {
+        // Two events in the same tx are distinct on-chain facts and must not
+        // collapse into one projection.
+        assert_ne!(sample_key(0), sample_key(1));
+        assert_ne!(sample_key(0).canonical(), sample_key(1).canonical());
+    }
+
+    #[test]
+    fn event_type_labels_match_ownership_matrix() {
+        // The persisted `event_type` column is part of the ownership contract;
+        // these labels are consumed by analytics and must stay stable.
+        let pool_created = ProjectedEvent::PoolCreated(PoolCreatedEvent {
+            pool_id: 1,
+            creator: "GABC".into(),
+            question: "q".into(),
+            options: vec!["a".into(), "b".into()],
+            deadline: 0,
+            created_at: 0,
+        });
+        assert_eq!(pool_created.event_type(), "pool_created");
+
+        let resolved = ProjectedEvent::PoolResolved {
+            pool_id: 1,
+            winning_outcome: 0,
+        };
+        assert_eq!(resolved.event_type(), "pool_resolved");
+    }
+
+    #[test]
+    fn projection_summary_defaults_to_zero() {
+        // A batch with no events must report no applied/duplicate projections.
+        let summary = ProjectionSummary::default();
+        assert_eq!(summary.applied, 0);
+        assert_eq!(summary.duplicates, 0);
+    }
 }

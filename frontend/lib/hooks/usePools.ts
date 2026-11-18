@@ -92,3 +92,21 @@ export function usePools(query: PoolsQuery = {}): UsePoolsResult {
     cacheKey: key,
   };
 }
+
+/**
+ * Field-level ownership for pool data surfaced by {@link usePools}.
+ *
+ * The indexer/API is the source of truth for every pool field below; the hook
+ * never derives or overrides them. When a request fails while cached data is
+ * available (`isStale`), the last known authoritative values are served as-is
+ * rather than being replaced with defaults. Defaults (`[]` / `0`) are only
+ * applied when no data has ever loaded.
+ *
+ * See `docs/data-ownership.md` for the full matrix and conflict behavior.
+ */
+export const POOL_FIELD_OWNERSHIP = {
+  pools: { source: "indexer", fallback: "empty-array", staleBehavior: "serve-cached" },
+  total: { source: "indexer", fallback: "zero", staleBehavior: "serve-cached" },
+  limit: { source: "indexer", fallback: "zero", staleBehavior: "serve-cached" },
+  offset: { source: "indexer", fallback: "zero", staleBehavior: "serve-cached" },
+} as const;

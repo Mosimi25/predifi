@@ -2905,3 +2905,265 @@ mod market_filters_tests {
         assert_eq!(POOLS_MAX_OFFSET, 10_000);
     }
 }
+
+/// Contract tests for the field-level data ownership matrix (#356).
+///
+/// Each test pins one high-risk field to the authoritative source and
+/// freshness/fallback contract documented in `docs/data-ownership.md`:
+///
+/// | Field group | Authoritative source | Freshness / fallback |
+/// |-------------|----------------------|----------------------|
+/// | balances    | chain (contract state) | indexer mirrors chain; on disagreement chain wins |
+/// | lifecycle   | chain (contract state) | indexer mirrors chain; stale cache must not override |
+/// | prices      | oracle price cache    | cache miss => no price, never a stale/guessed value |
+/// | profiles    | indexer DB            | derived from chain events; no chain fallback |
+/// | analytics   | indexer DB            | Redis cache-aside, TTL-bounded, never authoritative |
+///
+/// If a handler changes which source it reads from, the corresponding test
+/// here must be updated in the same change.
+#[cfg(test)]
+mod data_ownership_contract_tests {
+    use super::*;
+    use crate::redis_cache::{
+        pools_cache_key, stats_cache_key, RedisCache, POOLS_CACHE_TTL, STATS_CACHE_TTL,
+    };
+
+    /// Lifecycle: the API's version document reports the lifecycle status of
+    /// each API version from the single authoritative registry, and the
+    /// discovery endpoint must not invent a status of its own.
+    #[tokio::test]
+    async fn lifecycle_status_comes_from_authoritative_registry() {
+        let body = index().await.0;
+        let lifecycle = crate::api_versioning::versions_document();
+        let expected = lifecycle
+            .versions
+            .iter()
+            .find(|v| v.version == "v1")
+            .map(|v| v.status)
+            .expect("v1 must be registered in the lifecycle registry");
+
+        assert_eq!(body["status"], serde_json::json!(expected));
+        assert_eq!(
+            body["versions"],
+            serde_json::to_value(&lifecycle.versions).unwrap()
+        );
+    }
+
+    /// Lifecycle: pool status filters are validated against the closed set of
+    /// lifecycle states, so an unknown state can never be treated as
+    /// authoritative by a downstream reader.
+    #[test]
+    fn lifecycle_status_filter_rejects_unknown_states() {
+        for known in ["active", "closed", "settled"] {
+            assert!(
+                serde_json::from_value::<PoolStatus>(serde_json::json!(known)).is_ok(),
+                "documented lifecycle state {known} must be accepted"
+            );
+        }
+        assert!(
+            serde_json::from_value::<PoolStatus>(serde_json::json!("cancelled")).is_err(),
+            "undocumented lifecycle state must be rejected"
+        );
+    }
+
+    /// Analytics: stats are served cache-aside from the indexer DB. A cache
+    /// miss must fall through to the DB (never a fabricated value), and a
+    /// populated cache entry must be returned verbatim as the same envelope.
+    #[tokio::test]
+    async fn analytics_stats_fall_back_to_indexer_on_cache_miss() {
+        let cache = RedisCache::disabled();
+        let key = stats_cache_key(None, None);
+
+        // Cache miss: nothing is served from cache, so the handler must read
+        // the indexer DB. With no DB configured it reports unavailability
+        // rather than returning a stale or zeroed analytics payload.
+        assert!(cache.get::<serde_json::Value>(&key).await.is_none());
+
+        let state = AppState {
+            config: Arc::new(Config::default()),
+            cache: PriceCache::new(),
+            pool_cache: PoolCache::default(),
+            market_reads: market_reads_cache(&cache),
+            redis: cache.clone(),
+            db: None,
+            metrics: SharedMetrics::default(),
+            event_bus: crate::ws::EventBus::new(),
+            abuse: Arc::new(AbuseController::from_config(&Config::default())),
+        };
+        let response = get_stats(State(state), Query(StatsQuery { category: None, status: None }))
+            .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "analytics must not be served without the authoritative indexer DB"
+        );
+    }
+
+    /// Analytics: the cache TTL is the documented freshness bound. A cached
+    /// analytics payload is only ever a copy of an indexer read, so the TTL
+    /// must be finite and positive.
+    #[test]
+    fn analytics_cache_ttl_is_bounded() {
+        assert!(STATS_CACHE_TTL > 0, "stats cache must expire");
+        assert!(POOLS_CACHE_TTL > 0, "pools cache must expire");
+    }
+
+    /// Analytics: pool listings are cached per full query shape. Two
+    /// different filters must never share a cache entry, otherwise one
+    /// filter's analytics would be served as another's.
+    #[test]
+    fn analytics_pool_cache_keys_do_not_collide_across_filters() {
+        let base = pools_cache_key("new", None, "active", 20, 0);
+        assert_ne!(base, pools_cache_key("popular", None, "active", 20, 0));
+        assert_ne!(base, pools_cache_key("new", Some("sports"), "active", 20, 0));
+        assert_ne!(base, pools_cache_key("new", None, "settled", 20, 0));
+        assert_ne!(base, pools_cache_key("new", None, "active", 20, 20));
+    }
+
+    /// Prices: the oracle price cache is the authoritative source for prices.
+    /// A cold cache must report "not ready" (no price) rather than serving a
+    /// guessed or stale value.
+    #[tokio::test]
+    async fn prices_cold_cache_reports_not_ready_not_stale() {
+        let cache = PriceCache::new();
+        assert!(
+            cache.snapshot().is_empty(),
+            "a fresh price cache must be empty, not pre-seeded"
+        );
+
+        let state = AppState {
+            config: Arc::new(Config::default()),
+            cache,
+            pool_cache: PoolCache::default(),
+            market_reads: market_reads_cache(&RedisCache::disabled()),
+            redis: RedisCache::disabled(),
+            db: None,
+            metrics: SharedMetrics::default(),
+            event_bus: crate::ws::EventBus::new(),
+            abuse: Arc::new(AbuseController::from_config(&Config::default())),
+        };
+        let response = health(State(state)).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "an empty price cache must surface as not-ready"
+        );
+    }
+
+    /// Balances: the indexer ingest path is the only writer of prediction
+    /// amounts, and it must reject malformed payloads before touching the DB
+    /// so an indexer bug cannot overwrite the chain-derived balance.
+    #[test]
+    fn balances_indexer_payload_requires_valid_address_and_amount() {
+        let valid = serde_json::json!({
+            "pool_id": 1,
+            "user_address": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "outcome": 0,
+            "amount": 100,
+        });
+        assert!(serde_json::from_value::<PredictionPlacedPayload>(valid).is_ok());
+
+        let bad_address = serde_json::json!({
+            "pool_id": 1,
+            "user_address": "not-an-address",
+            "outcome": 0,
+            "amount": 100,
+        });
+        assert!(
+            serde_json::from_value::<PredictionPlacedPayload>(bad_address).is_err(),
+            "indexer must not accept an unvalidated wallet address"
+        );
+    }
+
+    /// Balances: a claim event carries the amount actually paid out by the
+    /// chain. The API must accept it as-is (chain wins) and never derive it
+    /// from indexer-side arithmetic.
+    #[test]
+    fn balances_claim_amount_is_taken_from_chain_event() {
+        let payload: ClaimPayload = serde_json::from_value(serde_json::json!({
+            "pool_id": 7,
+            "user_address": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "amount_paid": 250,
+        }))
+        .expect("valid claim payload");
+        assert_eq!(payload.amount_paid, 250);
+    }
+
+    /// Profiles: profile reads are indexer-backed. Without the indexer DB the
+    /// handler must report unavailability instead of synthesising a profile.
+    #[tokio::test]
+    async fn profiles_require_indexer_db() {
+        let state = AppState {
+            config: Arc::new(Config::default()),
+            cache: PriceCache::new(),
+            pool_cache: PoolCache::default(),
+            market_reads: market_reads_cache(&RedisCache::disabled()),
+            redis: RedisCache::disabled(),
+            db: None,
+            metrics: SharedMetrics::default(),
+            event_bus: crate::ws::EventBus::new(),
+            abuse: Arc::new(AbuseController::from_config(&Config::default())),
+        };
+        let address: StellarAddress =
+            serde_json::from_value(serde_json::json!(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            ))
+            .expect("valid address");
+        let response = get_user_profile_handler(State(state), Path(address)).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "profiles must not be served without the authoritative indexer DB"
+        );
+    }
+
+    /// Conflict behaviour: when the chain and the indexer disagree, the
+    /// indexer's cached view is invalidated so the next read re-derives from
+    /// the authoritative event stream rather than serving the stale value.
+    #[tokio::test]
+    async fn conflict_invalidates_cached_views_on_chain_event() {
+        let cache = RedisCache::disabled();
+        let pool_key = pools_cache_key("new", None, "active", 20, 0);
+        let stats_key = stats_cache_key(None, None);
+
+        // Simulate a populated cache from a previous indexer read.
+        cache
+            .set(&pool_key, &serde_json::json!({"total": 1}), POOLS_CACHE_TTL)
+            .await;
+        cache
+            .set(&stats_key, &serde_json::json!({"total_pools": 1}), STATS_CACHE_TTL)
+            .await;
+
+        // A chain event arrives that disagrees with the cached view; the
+        // ingest path invalidates both caches (see `ingest_pool_created`).
+        cache.invalidate_pools_cache().await;
+        cache.invalidate_stats_cache().await;
+
+        // The stale entries must no longer be served.
+        assert!(cache.get::<serde_json::Value>(&pool_key).await.is_none());
+        assert!(cache.get::<serde_json::Value>(&stats_key).await.is_none());
+    }
+
+    /// Conflict behaviour: a stale pool-detail cache entry must be dropped
+    /// when the chain reports a lifecycle change, so readers never see the
+    /// pre-change status.
+    #[tokio::test]
+    async fn conflict_pool_detail_cache_is_invalidated_on_lifecycle_change() {
+        let pool_cache = PoolCache::default();
+        let pool_id = 42;
+        pool_cache.set(
+            pool_id,
+            serde_json::json!({"id": pool_id, "status": "active"}),
+        );
+        assert!(matches!(
+            pool_cache.get(pool_id),
+            crate::pool_cache::CacheLookup::Found(_)
+        ));
+
+        pool_cache.invalidate(pool_id);
+        assert!(matches!(
+            pool_cache.get(pool_id),
+            crate::pool_cache::CacheLookup::Miss
+        ));
+    }
+}

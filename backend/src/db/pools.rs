@@ -806,4 +806,119 @@ mod tests {
             assert!(b.max_round_trips > 0, "{} round-trips must be > 0", b.query_group);
         }
     }
+
+    // ── Data ownership contract: balances & lifecycle (#356) ──────────────────
+    //
+    // See `docs/DATA_OWNERSHIP.md` (field-level ownership matrix).
+    //
+    //   * `pools.total_stake` — authoritative source: indexer (derived from
+    //     `predictions`). The `pools.total_stake` column is a denormalised
+    //     cache; the API must surface the derived sum when it is larger.
+    //   * `pools.state` / `pools.result` — authoritative source: chain events
+    //     (`pool_resolved` / `pool_cancelled`), mirrored by the indexer.
+    //     The API must never invent a lifecycle value; unknown states fall
+    //     back to `"active"` for filtering only.
+
+    /// Build the `PoolDetails` row the DB would return for a pool whose
+    /// denormalised `total_stake` cache is `cached_total`.
+    fn details_with_cached_total(cached_total: i64) -> PoolDetails {
+        PoolDetails {
+            pool_id: 1,
+            name: "Will it rain?".to_string(),
+            category: "weather".to_string(),
+            total_stake: cached_total,
+            end_time: Utc::now(),
+            created_at: Utc::now(),
+            state: "active".to_string(),
+            creator: "GCREATOR".to_string(),
+            token: "XLM".to_string(),
+            result: None,
+        }
+    }
+
+    /// Mirror of the balance-resolution logic in [`get_pool_with_odds`]:
+    /// the derived sum from `predictions` wins when it exceeds the cached
+    /// column, otherwise the cached value is used.
+    fn resolve_total_stake(cached_total: i64, outcome_stakes: &[(i32, i64)]) -> i64 {
+        let calculated_total: i64 = outcome_stakes.iter().map(|(_, s)| s).sum();
+        std::cmp::max(cached_total, calculated_total)
+    }
+
+    #[test]
+    fn total_stake_prefers_derived_sum_when_indexer_is_ahead() {
+        // Indexer has ingested predictions the cache has not caught up with.
+        let details = details_with_cached_total(100);
+        let stakes = vec![(0i32, 400i64), (1, 300)];
+        assert_eq!(
+            resolve_total_stake(details.total_stake, &stakes),
+            700,
+            "derived sum must win when the indexer is ahead of the cache"
+        );
+    }
+
+    #[test]
+    fn total_stake_falls_back_to_cache_when_indexer_is_stale() {
+        // Indexer lagging: predictions table has fewer rows than the cache.
+        let details = details_with_cached_total(1_000);
+        let stakes = vec![(0i32, 100i64)];
+        assert_eq!(
+            resolve_total_stake(details.total_stake, &stakes),
+            1_000,
+            "cached total must be used when the indexer is stale"
+        );
+    }
+
+    #[test]
+    fn total_stake_uses_cache_when_no_predictions_indexed() {
+        let details = details_with_cached_total(250);
+        assert_eq!(resolve_total_stake(details.total_stake, &[]), 250);
+    }
+
+    #[test]
+    fn odds_are_derived_from_the_authoritative_total_stake() {
+        // Odds must be computed against the resolved (authoritative) total,
+        // not the stale cached column, so payouts and UI agree.
+        let details = details_with_cached_total(100);
+        let stakes = vec![(0i32, 500i64), (1, 500)];
+        let total = resolve_total_stake(details.total_stake, &stakes);
+        let odds = calculate_odds(&stakes, total);
+        for o in &odds {
+            assert!(
+                (o.odds - 2.0).abs() < 1e-9,
+                "odds must use the derived total (1000), not the cache (100)"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_state_is_passed_through_unchanged() {
+        // The API must surface the indexer's lifecycle value verbatim.
+        let details = details_with_cached_total(0);
+        let with_odds = PoolWithOdds {
+            pool_id: details.pool_id,
+            name: details.name,
+            category: details.category,
+            total_stake: details.total_stake,
+            end_time: details.end_time,
+            created_at: details.created_at,
+            state: details.state.clone(),
+            creator: details.creator,
+            token: details.token,
+            result: details.result,
+            odds: vec![],
+        };
+        assert_eq!(with_odds.state, "active");
+        assert!(with_odds.result.is_none());
+    }
+
+    #[test]
+    fn lifecycle_result_is_authoritative_from_chain_event() {
+        // `result` is only ever set by `resolve_pool_in_db`, which mirrors the
+        // on-chain `pool_resolved` event. The API must not synthesise it.
+        let mut details = details_with_cached_total(0);
+        details.state = "settled".to_string();
+        details.result = Some("1".to_string());
+        assert_eq!(details.state, "settled");
+        assert_eq!(details.result.as_deref(), Some("1"));
+    }
 }

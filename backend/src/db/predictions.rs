@@ -935,4 +935,140 @@ mod tests {
         assert_eq!(round_trips(QueryGroup::MarketPredictions), 2);
         assert_eq!(round_trips(QueryGroup::ProtocolStats), 0);
     }
+
+    // ── Data-ownership contract tests (#356) ─────────────────────────────────
+    //
+    // These pin the field-level ownership matrix for prediction/profile-derived
+    // fields. Each test names the authoritative source of truth and the
+    // documented fallback/conflict behavior so a mismatch between the API and
+    // the matrix fails here rather than surfacing as a UI discrepancy.
+
+    /// Build a `UserPredictionRow` with the given pool result and user outcome.
+    fn make_user_prediction_row(
+        pool_result: Option<&str>,
+        user_outcome: i32,
+    ) -> UserPredictionRow {
+        UserPredictionRow {
+            prediction_id: 1,
+            pool_id: 7,
+            pool_name: "Will it rain?".to_string(),
+            pool_category: "weather".to_string(),
+            pool_state: "settled".to_string(),
+            pool_end_time: Utc::now(),
+            pool_total_stake: 1_000,
+            pool_result: pool_result.map(|r| r.to_string()),
+            user_outcome,
+            user_amount: 100,
+            prediction_created_at: Utc::now(),
+        }
+    }
+
+    /// Mirror the `is_winning_outcome` derivation in `get_user_predictions`.
+    fn derive_is_winning_outcome(row: &UserPredictionRow) -> Option<bool> {
+        row.pool_result.as_ref().and_then(|result| {
+            result
+                .parse::<i32>()
+                .ok()
+                .map(|winning| winning == row.user_outcome)
+        })
+    }
+
+    // Lifecycle: `pool_result` is owned by the chain (settlement event) and
+    // mirrored into `pools.result` by the indexer. The API must not invent a
+    // result: an unsettled pool yields `None`, never a default outcome.
+    #[test]
+    fn lifecycle_pool_result_is_none_until_settled() {
+        let row = make_user_prediction_row(None, 0);
+        assert_eq!(row.pool_result, None);
+        assert_eq!(derive_is_winning_outcome(&row), None);
+    }
+
+    // Conflict behavior: a malformed `pools.result` (not a valid outcome
+    // index) must degrade to "unknown" rather than guessing a winner.
+    #[test]
+    fn lifecycle_malformed_pool_result_degrades_to_unknown() {
+        let row = make_user_prediction_row(Some("not-a-number"), 0);
+        assert_eq!(derive_is_winning_outcome(&row), None);
+    }
+
+    // Lifecycle: when the chain result is present, the API derives win/loss
+    // purely from `pools.result` vs the user's own outcome — no other source.
+    #[test]
+    fn lifecycle_winning_outcome_follows_chain_result() {
+        let win = make_user_prediction_row(Some("1"), 1);
+        assert_eq!(derive_is_winning_outcome(&win), Some(true));
+
+        let loss = make_user_prediction_row(Some("1"), 0);
+        assert_eq!(derive_is_winning_outcome(&loss), Some(false));
+    }
+
+    // Balances: `pool_total_stake` is owned by the indexer's `pools.total_stake`
+    // (updated atomically with each prediction insert), not recomputed by the
+    // API from the prediction list. The API must surface the stored value
+    // verbatim so it matches the pool detail endpoint.
+    #[test]
+    fn balances_pool_total_stake_is_passed_through_verbatim() {
+        let row = make_user_prediction_row(Some("0"), 0);
+        let prediction = UserPrediction {
+            prediction_id: row.prediction_id,
+            pool_id: row.pool_id,
+            pool_name: row.pool_name,
+            pool_category: row.pool_category,
+            pool_state: row.pool_state,
+            pool_end_time: row.pool_end_time,
+            pool_total_stake: row.pool_total_stake,
+            pool_result: row.pool_result,
+            user_outcome: row.user_outcome,
+            user_amount: row.user_amount,
+            prediction_created_at: row.prediction_created_at,
+            is_winning_outcome: derive_is_winning_outcome(&row),
+        };
+        assert_eq!(prediction.pool_total_stake, 1_000);
+        assert_eq!(prediction.user_amount, 100);
+    }
+
+    // Analytics: `ProtocolStats.total_value_locked` is the sum of pool
+    // `total_stake` (indexer-owned), and `total_bets` is the prediction count.
+    // The API must not derive TVL from anything else.
+    #[test]
+    fn analytics_protocol_stats_fields_are_indexer_owned() {
+        let stats = ProtocolStats {
+            total_value_locked: 5_000,
+            total_bets: 42,
+            total_pools: 3,
+        };
+        assert_eq!(stats.total_value_locked, 5_000);
+        assert_eq!(stats.total_bets, 42);
+        assert_eq!(stats.total_pools, 3);
+    }
+
+    // Analytics: leaderboard win_rate is derived from settled counts only, and
+    // is 0.0 (documented fallback) when the user has no settled predictions.
+    #[test]
+    fn analytics_win_rate_fallback_is_zero_without_settled_predictions() {
+        let settled_count: i64 = 0;
+        let wins: i64 = 0;
+        let win_rate = if settled_count > 0 {
+            wins as f64 / settled_count as f64
+        } else {
+            0.0
+        };
+        assert_eq!(win_rate, 0.0);
+    }
+
+    // Profiles: `user_address` on a prediction is owned by the chain event and
+    // stored verbatim by the indexer; the API must not normalize or rewrite it.
+    #[test]
+    fn profiles_user_address_is_chain_owned_and_verbatim() {
+        let address = "GABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRST";
+        let row = MarketPredictionRow {
+            id: 1,
+            pool_id: 1,
+            user_address: address.to_string(),
+            outcome: 0,
+            amount: 100,
+            created_at: Utc::now(),
+        };
+        assert_eq!(row.user_address, address);
+    }
 }

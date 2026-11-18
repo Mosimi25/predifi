@@ -46,6 +46,39 @@ export function validateRelease(example) {
     }
   }
 
+  // Verify frontend build provenance and artifact digest policy
+  if (example.frontend != null) {
+    const frontend = example.frontend;
+    requireCond(frontend.source_revision != null, 'missing frontend source revision');
+    requireCond(
+      /^[0-9a-f]{40}$/.test(frontend.source_revision),
+      'invalid frontend source revision'
+    );
+    requireCond(frontend.source_revision === source.commit, 'frontend source revision mismatch');
+    requireCond(frontend.lockfile_hash != null, 'missing frontend lockfile hash');
+    requireCond(/^[0-9a-f]{64}$/.test(frontend.lockfile_hash), 'invalid frontend lockfile hash');
+    requireCond(frontend.toolchain != null, 'missing frontend toolchain');
+    requireCond(frontend.artifact_digest != null, 'missing frontend artifact digest');
+    requireCond(
+      /^sha256:[0-9a-f]{64}$/.test(frontend.artifact_digest),
+      'invalid frontend artifact digest'
+    );
+
+    // Compare the recorded digest against the built artifact when available
+    if (frontend.built_artifact_hex != null) {
+      const builtDigest =
+        'sha256:' +
+        crypto
+          .createHash('sha256')
+          .update(Buffer.from(frontend.built_artifact_hex, 'hex'))
+          .digest('hex');
+      requireCond(
+        builtDigest === frontend.artifact_digest,
+        'frontend artifact digest mismatch'
+      );
+    }
+  }
+
   const artifacts = {};
   for (const item of example.artifacts) {
     requireCond(!artifacts[item.id], 'duplicate artifact ID');
@@ -108,6 +141,92 @@ export function validateRelease(example) {
   }
 }
 
+const LINK_CHECK_DOCS = [
+  'docs/maintainer-handbook.md',
+  'docs/quickstart.md',
+];
+
+function listRunbookDocs() {
+  const runbooksDir = path.join(ROOT, 'docs', 'runbooks');
+  if (!fs.existsSync(runbooksDir)) {
+    return [];
+  }
+  return fs
+    .readdirSync(runbooksDir)
+    .filter((name) => name.endsWith('.md'))
+    .sort()
+    .map((name) => path.posix.join('docs/runbooks', name));
+}
+
+function slugifyHeading(text) {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, '')
+    .replace(/\s+/g, '-');
+}
+
+function collectAnchors(filePath) {
+  const anchors = new Set();
+  const content = fs.readFileSync(filePath, 'utf8');
+  for (const line of content.split(/\r?\n/)) {
+    const match = /^#{1,6}\s+(.*)$/.exec(line);
+    if (match) {
+      anchors.add(slugifyHeading(match[1]));
+    }
+  }
+  return anchors;
+}
+
+function extractRelativeLinks(content) {
+  const links = [];
+  const pattern = /\[[^\]]*\]\(([^)\s]+)\)/g;
+  let match;
+  while ((match = pattern.exec(content)) !== null) {
+    const target = match[1];
+    if (/^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith('#')) {
+      continue;
+    }
+    links.push(target);
+  }
+  return links;
+}
+
+export function checkHandbookLinks(docs = [...LINK_CHECK_DOCS, ...listRunbookDocs()]) {
+  const broken = [];
+
+  for (const doc of docs) {
+    const docPath = path.join(ROOT, doc);
+    if (!fs.existsSync(docPath)) {
+      broken.push(`${doc}: missing document`);
+      continue;
+    }
+
+    const content = fs.readFileSync(docPath, 'utf8');
+    for (const link of extractRelativeLinks(content)) {
+      const [targetPath, anchor] = link.split('#');
+      const resolved = targetPath
+        ? path.resolve(path.dirname(docPath), targetPath)
+        : docPath;
+
+      if (!fs.existsSync(resolved)) {
+        broken.push(`${doc}: broken link ${link}`);
+        continue;
+      }
+
+      if (anchor && resolved.endsWith('.md')) {
+        const anchors = collectAnchors(resolved);
+        if (!anchors.has(anchor.toLowerCase())) {
+          broken.push(`${doc}: broken anchor ${link}`);
+        }
+      }
+    }
+  }
+
+  requireCond(broken.length === 0, `broken handbook links:\n${broken.join('\n')}`);
+  console.log(`PASS: handbook links resolve (${docs.length} documents)`);
+}
+
 export function runValidationSuite(targetFile) {
   const filePath = targetFile || path.join(ROOT, 'docs', 'releases', 'contract-release.example.json');
   const example = JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -143,6 +262,32 @@ export function runValidationSuite(targetFile) {
     requireCond(err.message === 'missing build toolchain', `unexpected rejection: ${err.message}`);
     console.log('PASS: rejected missing build toolchain');
   }
+
+  // Negative test cases: frontend provenance and artifact digest policy
+  if (example.frontend != null) {
+    const frontendCases = [
+      ['source_revision', null, 'missing frontend source revision'],
+      ['source_revision', '2'.repeat(40), 'frontend source revision mismatch'],
+      ['lockfile_hash', null, 'missing frontend lockfile hash'],
+      ['lockfile_hash', 'not-a-hash', 'invalid frontend lockfile hash'],
+      ['toolchain', null, 'missing frontend toolchain'],
+      ['artifact_digest', null, 'missing frontend artifact digest'],
+      ['artifact_digest', 'sha256:' + '0'.repeat(64), 'frontend artifact digest mismatch'],
+    ];
+
+    for (const [key, value, expected] of frontendCases) {
+      const changed = JSON.parse(JSON.stringify(example));
+      changed.frontend[key] = value;
+      try {
+        validateRelease(changed);
+      } catch (err) {
+        requireCond(err.message === expected, `unexpected rejection: ${err.message}`);
+        console.log(`PASS: rejected ${expected}`);
+      }
+    }
+  }
+
+  checkHandbookLinks();
 
   console.log('No WASM executed and no network deployment performed.');
 }

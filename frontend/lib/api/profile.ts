@@ -4,6 +4,25 @@
  * Thin, typed wrapper around `GET /api/v1/users/:address/profile` — the
  * aggregated payload behind the profile page (prediction history, win/loss
  * stats, total earnings, active positions, and claim status).
+ *
+ * Data ownership (see docs/data-ownership-matrix.md):
+ * - `stats.*` (balances, lifecycle, analytics) are owned by the indexer and
+ *   served by the API. The UI must treat them as read-only projections and
+ *   never recompute them client-side.
+ * - `claims[].claimed` / `claimed_amount` are owned by the chain (claim
+ *   registry). The API mirrors them; the UI must not optimistically flip
+ *   `claimed` without a refetch.
+ * - `claims[].pool_state` / `pool_result` are owned by the chain (pool
+ *   contract) and mirrored by the indexer.
+ * - `performance[]` is an indexer-owned analytics rollup; it is advisory and
+ *   may lag behind `stats`.
+ *
+ * Freshness / fallback contract:
+ * - The API is the single source of truth for the profile page. There is no
+ *   client-side fallback to chain reads; on failure the UI surfaces an error
+ *   state rather than stale or synthesized values.
+ * - Malformed payloads are rejected at the boundary (see type guards) so the
+ *   UI never renders partially-valid data.
  */
 
 import { API_BASE_URL, ApiError } from "@/lib/api/pools";
